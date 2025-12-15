@@ -1,0 +1,16 @@
+# 配置文件示例
+# 复制此文件为 config.yaml 并修改相应的配置值
+
+# Model 配置
+model:
+  domain: "xwenlitest2"
+  max_tokens: 16384
+  messages_key: "messages"
+  password: ""
+  temperature: 0.6
+
+# 处理配置
+test_lines: 500        # 测试行数
+max_retry_count: 0    # 最大重试次数
+lines_per_chunk: 200 # 默认每个分块50000行，不能超过这个值
+
