@@ -1,151 +1,102 @@
 package main
 
-// ChunkManager Chunk管理器
 type ChunkManager struct {
-	dbManager   *DBManager
-	fileManager *FileManager
+	dbManager    *DBManager
+	fileManager  *FileManager
 	batchManager *BatchManager
 }
 
-// NewChunkManager 创建Chunk管理器
-func NewChunkManager(dbManager *DBManager, fileManager *FileManager, batchManager *BatchManager) *ChunkManager {
-	return &ChunkManager{
-		dbManager:    dbManager,
-		fileManager:  fileManager,
-		batchManager: batchManager,
-	}
+func NewChunkManager(db *DBManager, fm *FileManager, bm *BatchManager) *ChunkManager {
+	return &ChunkManager{dbManager: db, fileManager: fm, batchManager: bm}
 }
 
 // UploadChunk 上传文件块
-func (cm *ChunkManager) UploadChunk(chunkID string, fileData []byte) bool {
-	// 获取文件块信息
-	chunk, err := cm.dbManager.GetChunk(chunkID)
-	if err != nil || chunk == nil {
-		logError("文件块不存在: %s", chunkID)
-		return false
-	}
+func (cm *ChunkManager) UploadChunk(id string, data []byte) bool {
+	c, _ := cm.dbManager.GetChunk(id)
+	if c == nil { return false }
 
-	// 上传文件，完成后直接更新为已上传状态
-	if chunk.UploadFileID == nil {
-		uploadFileID, err := cm.batchManager.UploadFile(chunk.ChunkPath)
+	if c.UploadFileID == nil {
+		// 如果 data 为 nil，尝试从文件读取
+		uid, err := cm.batchManager.UploadFile(c.ChunkPath)
 		if err != nil {
-			logError("上传文件块失败: %v", err)
-			errorMsg := err.Error()
-			cm.dbManager.UpdateChunkStatus(chunkID, ChunkStatusUploadFailed, &errorMsg)
+			em := err.Error()
+			cm.dbManager.UpdateChunkStatus(id, ChunkStatusUploadFailed, &em)
 			return false
 		}
 		
-		if err := cm.dbManager.UpdateChunkUploadFileID(chunkID, uploadFileID); err != nil {
-			logError("更新upload_file_id失败: %v", err)
-			return false
+		if err := cm.dbManager.UpdateChunkUploadSuccess(id, uid); err != nil {
+			logError("严重错误：保存上传状态失败 [%s]: %v", id, err)
+			return false 
 		}
-		chunk.UploadFileID = &uploadFileID
+		c.UploadFileID = &uid
 	}
 
-	if err := cm.dbManager.UpdateChunkStatus(chunkID, ChunkStatusUploaded, nil); err != nil {
-		logError("更新chunk状态失败: %v", err)
-		return false
-	}
-
+	// 自动进入下一阶段
+	cm.dbManager.UpdateChunkStatus(id, ChunkStatusUploaded, nil)
 	return true
 }
 
-// ChunkStartProcess 标记文件块为处理中
-func (cm *ChunkManager) ChunkStartProcess(chunkID string) bool {
-	chunk, err := cm.dbManager.GetChunk(chunkID)
-	if err != nil || chunk == nil {
-		logError("文件块不存在: %s", chunkID)
-		return false
-	}
+// ChunkStartProcess 开始处理
+func (cm *ChunkManager) ChunkStartProcess(id string) bool {
+	c, _ := cm.dbManager.GetChunk(id)
+	if c == nil { return false }
 
-	if chunk.UploadFileID == nil || chunk.Status != ChunkStatusUploaded {
-		logError("文件块上传文件id不存在或状态不为已上传: %s", chunkID)
-		return false
+	if c.Status != ChunkStatusUploaded || c.UploadFileID == nil { 
+		return false 
 	}
+	
+	if c.BatchID != nil { return true }
 
-	if chunk.BatchID != nil {
-		logInfo("文件块batch_id已存在: %s", chunkID)
-		return true
+	bid, err := cm.batchManager.CreateBatchTask(*c.UploadFileID)
+	if err != nil { 
+		logError("创建Batch任务失败 [%s]: %v", id, err)
+		return false 
 	}
-
-	batchID, err := cm.batchManager.CreateBatchTask(*chunk.UploadFileID)
-	if err != nil {
-		logError("创建batch任务失败: %v", err)
-		return false
-	}
-
-	if err := cm.dbManager.UpdateChunkBatchID(chunkID, batchID); err != nil {
-		logError("更新batch_id失败: %v", err)
-		return false
-	}
-
-	if err := cm.dbManager.UpdateChunkStatus(chunkID, ChunkStatusProcessing, nil); err != nil {
-		logError("更新chunk状态失败: %v", err)
-		return false
-	}
-
+	
+	cm.dbManager.UpdateChunkBatchID(id, bid)
+	cm.dbManager.UpdateChunkStatus(id, ChunkStatusProcessing, nil)
 	return true
 }
 
-// CheckChunkProcess 标记文件块为已处理
-func (cm *ChunkManager) CheckChunkProcess(chunkID string) bool {
-	chunk, err := cm.dbManager.GetChunk(chunkID)
-	if err != nil || chunk == nil {
-		logError("文件块不存在: %s", chunkID)
-		return false
-	}
-
-	if chunk.BatchID == nil {
-		logError("文件块batch_id不存在: %s", chunkID)
-		return false
-	}
-
-	if chunk.Status == ChunkStatusProcessed || chunk.Status == ChunkStatusCanceled {
-		return true
-	}
-
-	result, err := cm.batchManager.GetResult(*chunk.BatchID)
-	if err != nil {
-		logError("获取batch结果失败: %v", err)
-		return false
-	}
-
-	if result == nil {
-		return false
-	}
-
-	if chunk.Status == ChunkStatusUploaded {
-		cm.dbManager.UpdateChunkStatus(chunkID, ChunkStatusProcessing, nil)
-	}
-
-	if err := cm.dbManager.UpdateChunkBatchTaskInfo(chunkID, result); err != nil {
-		logError("更新batch_task_info失败: %v", err)
-		return false
-	}
-
-	if result.IsFinished() {
-		if result.OutputFileID != "" {
-			content, err := cm.batchManager.GetFileContent(result.OutputFileID)
+// CheckChunkProcess 检查结果
+func (cm *ChunkManager) CheckChunkProcess(id string) bool {
+	c, _ := cm.dbManager.GetChunk(id)
+	if c == nil || c.BatchID == nil { return false }
+	
+	if c.Status == ChunkStatusProcessed || c.Status == ChunkStatusCanceled { return true }
+	
+	res, err := cm.batchManager.GetResult(*c.BatchID)
+	if err != nil || res == nil { return false }
+	
+	cm.dbManager.UpdateChunkBatchTaskInfo(id, res)
+	
+	if res.IsFinished() {
+		// 【修复点 1】OutputFileID 是 string，直接判空，不需要解引用
+		if res.OutputFileID != "" {
+			data, err := cm.batchManager.GetFileContent(res.OutputFileID)
 			if err == nil {
-				cm.fileManager.SaveFile(chunk.FileID, chunk.ChunkID, content, false)
+				cm.fileManager.SaveFile(c.TaskID, c.ChunkID, string(data), false)
+			} else {
+				logError("下载结果失败 [%s]: %v", id, err)
 			}
 		}
 
-		if result.ErrorFileID != nil && *result.ErrorFileID != "" {
-			content, err := cm.batchManager.GetFileContent(*result.ErrorFileID)
+		// 【修复点 2】ErrorFileID 仍然是 *string，需要判 nil 和解引用
+		if res.ErrorFileID != nil && *res.ErrorFileID != "" {
+			data, err := cm.batchManager.GetFileContent(*res.ErrorFileID)
 			if err == nil {
-				cm.fileManager.SaveFile(chunk.FileID, chunk.ChunkID, content, true)
+				cm.fileManager.SaveFile(c.TaskID, c.ChunkID, string(data), true)
 			}
 		}
 
-		if err := cm.dbManager.UpdateChunkStatus(chunkID, ChunkStatusProcessed, nil); err != nil {
-			logError("更新chunk状态失败: %v", err)
-			return false
+		newStatus := ChunkStatusSuccess
+		if res.Status == BatchStatusFailed || res.Status == BatchStatusExpired || res.Status == BatchStatusCanceled {
+			newStatus = ChunkStatusFailed
 		}
-
+		
+		cm.dbManager.UpdateChunkStatus(id, newStatus, nil)
 		return true
 	}
-
+	
 	return false
 }
-

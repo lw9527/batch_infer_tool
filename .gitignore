@@ -1,0 +1,9 @@
+﻿batch_result/
+merged/
+logs/
+chunks/
+*.jsonl
+*.db
+*.exe
+file_status
+daemon.lock

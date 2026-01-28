@@ -1,46 +1,42 @@
-# Go 版本批量推理服务
+# The Go Programming Language
 
-这是 Python 版本的 Go 语言实现，提供更好的代码保护能力。
+Go is an open source programming language that makes it easy to build simple,
+reliable, and efficient software.
 
-## 编译
+![Gopher image](https://golang.org/doc/gopher/fiveyears.jpg)
+*Gopher image by [Renee French][rf], licensed under [Creative Commons 4.0 Attribution license][cc4-by].*
 
-### 安装依赖
+Our canonical Git repository is located at https://go.googlesource.com/go.
+There is a mirror of the repository at https://github.com/golang/go.
 
-```bash
-cd src
-go mod download
-```
+Unless otherwise noted, the Go source files are distributed under the
+BSD-style license found in the LICENSE file.
 
-### 编译
+### Download and Install
 
-```bash
-# Windows
-go build -ldflags="-s -w" -o batch_infer.exe
+#### Binary Distributions
 
-# Linux/macOS
-go build -ldflags="-s -w" -o batch_infer
-```
+Official binary distributions are available at https://go.dev/dl/.
 
-### 交叉编译
+After downloading a binary release, visit https://go.dev/doc/install
+for installation instructions.
 
-```bash
-# Windows x64
-set GOOS=windows
-set GOARCH=amd64
-go build -ldflags="-s -w" -o batch_infer_windows_amd64.exe
+#### Install From Source
 
-# Linux x64
-set GOOS=linux
-set GOARCH=amd64
-go build -ldflags="-s -w" -o batch_infer_linux_amd64
+If a binary distribution is not available for your combination of
+operating system and architecture, visit
+https://go.dev/doc/install/source
+for source installation instructions.
 
-# macOS x64
-set GOOS=darwin
-set GOARCH=amd64
-go build -ldflags="-s -w" -o batch_infer_darwin_amd64
+### Contributing
 
-# macOS ARM64
-set GOOS=darwin
-set GOARCH=arm64
-go build -ldflags="-s -w" -o batch_infer_darwin_arm64
-```
+Go is the work of thousands of contributors. We appreciate your help!
+
+To contribute, please read the contribution guidelines at https://go.dev/doc/contribute.
+
+Note that the Go project uses the issue tracker for bug reports and
+proposals only. See https://go.dev/wiki/Questions for a list of
+places to ask questions about the Go language.
+
+[rf]: https://reneefrench.blogspot.com/
+[cc4-by]: https://creativecommons.org/licenses/by/4.0/
