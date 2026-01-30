@@ -1,0 +1,17 @@
+﻿# 忽略目录
+chunks/
+merged/
+logs/
+log/
+batch_result/
+
+# 忽略特定文件类型
+*.jsonl
+*.csv
+*.db
+*.log
+*.exe
+
+# 忽略临时文件
+invalid_records.jsonl
+file_status.db
