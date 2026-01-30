@@ -3,596 +3,161 @@ package main
 import (
 	"database/sql"
 	"encoding/json"
+	"log"
+	"sync"
 	"time"
-
 	_ "modernc.org/sqlite"
 )
 
-// DBManager 数据库管理器
 type DBManager struct {
 	dbPath string
+	mu     sync.RWMutex
+	files  map[string]*FileInfo
 }
 
-// NewDBManager 创建数据库管理器
 func NewDBManager() *DBManager {
-	db := &DBManager{dbPath: DB_PATH}
-	db.initDatabase()
+	db := &DBManager{dbPath: DB_PATH, files: make(map[string]*FileInfo)}
+	if err := db.initDatabase(); err != nil { log.Fatalf("DB初始化失败: %v", err) }
 	return db
 }
 
-// getConnection 获取数据库连接
-func (db *DBManager) getConnection() (*sql.DB, error) {
-	conn, err := sql.Open("sqlite", db.dbPath+"?_timeout=10000")
-	if err != nil {
-		return nil, err
-	}
-	return conn, nil
+func (db *DBManager) getConnection() (*sql.DB, error) { return sql.Open("sqlite", db.dbPath+"?_timeout=10000&_journal=WAL") }
+
+func (db *DBManager) initDatabase() error {
+	conn, err := db.getConnection(); if err != nil { return err }; defer conn.Close()
+	conn.Exec(`CREATE TABLE IF NOT EXISTS files (task_id TEXT PRIMARY KEY, original_filename TEXT NOT NULL, file_path TEXT NOT NULL, file_size INTEGER NOT NULL, total_chunks INTEGER NOT NULL, total_lines INTEGER DEFAULT 0, status TEXT NOT NULL, created_time TEXT NOT NULL, updated_time TEXT NOT NULL, merged_path TEXT, error_message TEXT, retry INTEGER DEFAULT 0, max_retry INTEGER DEFAULT 0)`)
+	conn.Exec(`CREATE TABLE IF NOT EXISTS chunks (chunk_id TEXT PRIMARY KEY, task_id TEXT NOT NULL, chunk_index INTEGER NOT NULL, chunk_path TEXT NOT NULL, chunk_size INTEGER NOT NULL, status TEXT NOT NULL, upload_file_id TEXT, batch_id TEXT, upload_time TEXT, process_time TEXT, error_message TEXT, batch_task_info TEXT, retry INTEGER DEFAULT 0, updated_time TEXT, FOREIGN KEY (task_id) REFERENCES files (task_id))`)
+	return nil
 }
 
-// initDatabase 初始化数据库
-func (db *DBManager) initDatabase() {
-	conn, err := db.getConnection()
-	if err != nil {
-		logError("初始化数据库失败: %v", err)
-		return
-	}
-	defer conn.Close()
-
-	// 设置连接池参数
-	conn.SetMaxOpenConns(1)
-	conn.SetMaxIdleConns(1)
-
-	// 创建文件信息表
-	_, err = conn.Exec(`
-		CREATE TABLE IF NOT EXISTS files (
-			file_id TEXT PRIMARY KEY,
-			original_filename TEXT NOT NULL,
-			file_path TEXT NOT NULL,
-			file_size INTEGER NOT NULL,
-			total_chunks INTEGER NOT NULL,
-			total_lines INTEGER DEFAULT 0,
-			status TEXT NOT NULL,
-			created_time TEXT NOT NULL,
-			updated_time TEXT NOT NULL,
-			merged_path TEXT,
-			error_message TEXT,
-			retry INTEGER DEFAULT 0,
-			max_retry INTEGER DEFAULT 0
-		)
-	`)
-	if err != nil {
-		logError("创建files表失败: %v", err)
-		return
-	}
-
-	// 创建文件块表
-	_, err = conn.Exec(`
-		CREATE TABLE IF NOT EXISTS chunks (
-			chunk_id TEXT PRIMARY KEY,
-			file_id TEXT NOT NULL,
-			chunk_index INTEGER NOT NULL,
-			chunk_path TEXT NOT NULL,
-			chunk_size INTEGER NOT NULL,
-			status TEXT NOT NULL,
-			upload_file_id TEXT,
-			batch_id TEXT,
-			upload_time TEXT,
-			process_time TEXT,
-			error_message TEXT,
-			batch_task_info TEXT,
-			retry INTEGER DEFAULT 0,
-			FOREIGN KEY (file_id) REFERENCES files (file_id)
-		)
-	`)
-	if err != nil {
-		logError("创建chunks表失败: %v", err)
-		return
-	}
+// CheckTaskIDExists 检查ID存在
+func (db *DBManager) CheckTaskIDExists(taskID string) (bool, error) {
+	conn, err := db.getConnection(); if err != nil { return false, err }; defer conn.Close()
+	var count int
+	err = conn.QueryRow("SELECT count(*) FROM files WHERE task_id = ?", taskID).Scan(&count)
+	return count > 0, err
 }
 
-// CreateFile 创建文件记录
-func (db *DBManager) CreateFile(fileInfo *FileInfo) error {
-	conn, err := db.getConnection()
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
+func (db *DBManager) GetPendingFiles() ([]*FileInfo, error) { return db.GetActiveFiles() }
 
-	_, err = conn.Exec(`
-		INSERT INTO files (
-			file_id, original_filename, file_path, file_size,
-			total_chunks, total_lines, status, created_time, updated_time,
-			merged_path, error_message, retry, max_retry
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`,
-		fileInfo.FileID,
-		fileInfo.OriginalFilename,
-		fileInfo.FilePath,
-		fileInfo.FileSize,
-		fileInfo.TotalChunks,
-		fileInfo.TotalLines,
-		string(fileInfo.Status),
-		fileInfo.CreatedTime,
-		fileInfo.UpdatedTime,
-		fileInfo.MergedPath,
-		fileInfo.ErrorMessage,
-		fileInfo.Retry,
-		fileInfo.MaxRetry,
-	)
-	return err
-}
-
-// GetFile 获取文件信息
-func (db *DBManager) GetFile(fileID string) (*FileInfo, error) {
-	conn, err := db.getConnection()
-	if err != nil {
-		return nil, err
-	}
-	defer conn.Close()
-
-	var fileInfo FileInfo
-	err = conn.QueryRow(`
-		SELECT file_id, original_filename, file_path, file_size,
-		       total_chunks, total_lines, status, created_time, updated_time,
-		       merged_path, error_message, retry, max_retry
-		FROM files WHERE file_id = ?
-	`, fileID).Scan(
-		&fileInfo.FileID,
-		&fileInfo.OriginalFilename,
-		&fileInfo.FilePath,
-		&fileInfo.FileSize,
-		&fileInfo.TotalChunks,
-		&fileInfo.TotalLines,
-		&fileInfo.Status,
-		&fileInfo.CreatedTime,
-		&fileInfo.UpdatedTime,
-		&fileInfo.MergedPath,
-		&fileInfo.ErrorMessage,
-		&fileInfo.Retry,
-		&fileInfo.MaxRetry,
-	)
-	if err == sql.ErrNoRows {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-
-	// 获取文件块
-	rows, err := conn.Query(`
-		SELECT chunk_id, file_id, chunk_index, chunk_path, chunk_size,
-		       status, upload_file_id, batch_id, upload_time, process_time,
-		       error_message, batch_task_info, retry
-		FROM chunks WHERE file_id = ? ORDER BY chunk_index
-	`, fileID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	fileInfo.Chunks = []*FileChunk{}
-	for rows.Next() {
-		var chunk FileChunk
-		var uploadFileID, batchID, uploadTime, processTime, errorMessage, batchTaskInfoJSON sql.NullString
-
-		err := rows.Scan(
-			&chunk.ChunkID,
-			&chunk.FileID,
-			&chunk.ChunkIndex,
-			&chunk.ChunkPath,
-			&chunk.ChunkSize,
-			&chunk.Status,
-			&uploadFileID,
-			&batchID,
-			&uploadTime,
-			&processTime,
-			&errorMessage,
-			&batchTaskInfoJSON,
-			&chunk.Retry,
-		)
-		if err != nil {
-			continue
-		}
-
-		if uploadFileID.Valid {
-			chunk.UploadFileID = &uploadFileID.String
-		}
-		if batchID.Valid {
-			chunk.BatchID = &batchID.String
-		}
-		if uploadTime.Valid {
-			chunk.UploadTime = &uploadTime.String
-		}
-		if processTime.Valid {
-			chunk.ProcessTime = &processTime.String
-		}
-		if errorMessage.Valid {
-			chunk.ErrorMessage = &errorMessage.String
-		}
-
-		// 解析 batch_task_info
-		if batchTaskInfoJSON.Valid && batchTaskInfoJSON.String != "" {
-			var batchTaskInfo BatchTaskInfo
-			if err := json.Unmarshal([]byte(batchTaskInfoJSON.String), &batchTaskInfo); err == nil {
-				chunk.BatchTaskInfo = &batchTaskInfo
-			}
-		}
-
-		fileInfo.Chunks = append(fileInfo.Chunks, &chunk)
-	}
-
-	return &fileInfo, nil
-}
-
-// GetAllFiles 获取所有文件信息
-func (db *DBManager) GetAllFiles() ([]*FileInfo, error) {
-	conn, err := db.getConnection()
-	if err != nil {
-		return nil, err
-	}
-	defer conn.Close()
-
-	rows, err := conn.Query(`SELECT file_id FROM files ORDER BY created_time DESC`)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var fileIDs []string
-	for rows.Next() {
-		var fileID string
-		if err := rows.Scan(&fileID); err == nil {
-			fileIDs = append(fileIDs, fileID)
-		}
-	}
-
+func (db *DBManager) GetActiveFiles() ([]*FileInfo, error) {
+	conn, err := db.getConnection(); if err != nil { return nil, err }; defer conn.Close()
+	rows, err := conn.Query(`SELECT task_id FROM files WHERE status NOT IN (?, ?, ?) ORDER BY created_time DESC`, FileStatusProcessCompleted, FileStatusFailed, FileStatusCanceled)
+	if err != nil { return nil, err }; defer rows.Close()
 	var files []*FileInfo
-	for _, fileID := range fileIDs {
-		file, err := db.GetFile(fileID)
-		if err == nil && file != nil {
-			files = append(files, file)
-		}
+	for rows.Next() {
+		var id string; rows.Scan(&id)
+		if f, _ := db.GetFile(id); f != nil { files = append(files, f) }
 	}
-
 	return files, nil
 }
 
-// GetFileByFilename 通过文件名查询文件信息（返回第一个匹配的文件）
-func (db *DBManager) GetFileByFilename(filename string) (*FileInfo, error) {
-	conn, err := db.getConnection()
-	if err != nil {
-		return nil, err
-	}
-	defer conn.Close()
-
-	var fileID string
-	err = conn.QueryRow(`
-		SELECT file_id FROM files WHERE original_filename = ? ORDER BY created_time DESC LIMIT 1
-	`, filename).Scan(&fileID)
-	if err == sql.ErrNoRows {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-
-	return db.GetFile(fileID)
-}
-
-// UpdateFileStatus 更新文件状态
-func (db *DBManager) UpdateFileStatus(fileID string, status FileStatus, errorMessage *string) error {
-	conn, err := db.getConnection()
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-
-	_, err = conn.Exec(`
-		UPDATE files 
-		SET status = ?, updated_time = ?, error_message = ?
-		WHERE file_id = ?
-	`, string(status), time.Now().Format(time.RFC3339), errorMessage, fileID)
+func (db *DBManager) CreateFile(f *FileInfo) error {
+	db.mu.Lock(); defer db.mu.Unlock()
+	conn, err := db.getConnection(); if err != nil { return err }; defer conn.Close()
+	_, err = conn.Exec(`INSERT INTO files (task_id, original_filename, file_path, file_size, total_chunks, total_lines, status, created_time, updated_time, retry, max_retry) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, f.TaskID, f.OriginalFilename, f.FilePath, f.FileSize, f.TotalChunks, f.TotalLines, f.Status, f.CreatedTime, f.UpdatedTime, f.Retry, f.MaxRetry)
+	if err == nil { db.files[f.TaskID] = f }
 	return err
 }
 
-// UpdateFileMergedPath 更新合并后的文件路径
-func (db *DBManager) UpdateFileMergedPath(fileID string, mergedPath string) error {
-	conn, err := db.getConnection()
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-
-	_, err = conn.Exec(`
-		UPDATE files 
-		SET merged_path = ?, updated_time = ?
-		WHERE file_id = ?
-	`, mergedPath, time.Now().Format(time.RFC3339), fileID)
+func (db *DBManager) AddChunk(c *FileChunk) error {
+	db.mu.Lock(); defer db.mu.Unlock()
+	conn, err := db.getConnection(); if err != nil { return err }; defer conn.Close()
+	var uid, bid interface{}
+	if c.UploadFileID != nil { uid = *c.UploadFileID }
+	if c.BatchID != nil { bid = *c.BatchID }
+	var infoJSON interface{}
+	if c.BatchTaskInfo != nil { b, _ := json.Marshal(c.BatchTaskInfo); infoJSON = string(b) }
+	_, err = conn.Exec(`INSERT INTO chunks (chunk_id, task_id, chunk_index, chunk_path, chunk_size, status, upload_file_id, batch_id, upload_time, process_time, error_message, batch_task_info, retry, updated_time) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, c.ChunkID, c.TaskID, c.ChunkIndex, c.ChunkPath, c.ChunkSize, c.Status, uid, bid, c.UploadTime, c.ProcessTime, c.ErrorMessage, infoJSON, c.Retry, time.Now().Format(time.RFC3339))
 	return err
 }
 
-// UpdateFileRetry 更新文件重试次数
-func (db *DBManager) UpdateFileRetry(fileID string, retry int) error {
-	conn, err := db.getConnection()
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-
-	_, err = conn.Exec(`
-		UPDATE files 
-		SET retry = ?, updated_time = ?
-		WHERE file_id = ?
-	`, retry, time.Now().Format(time.RFC3339), fileID)
-	return err
-}
-
-// UpdateFileTotalChunks 更新文件总块数
-func (db *DBManager) UpdateFileTotalChunks(fileID string, totalChunks int) error {
-	conn, err := db.getConnection()
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-
-	_, err = conn.Exec(`
-		UPDATE files 
-		SET total_chunks = ?, updated_time = ?
-		WHERE file_id = ?
-	`, totalChunks, time.Now().Format(time.RFC3339), fileID)
-	return err
-}
-
-// UpdateFileTotalLines 更新文件总行数
-func (db *DBManager) UpdateFileTotalLines(fileID string, totalLines int) error {
-	conn, err := db.getConnection()
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-
-	_, err = conn.Exec(`
-		UPDATE files 
-		SET total_lines = ?, updated_time = ?
-		WHERE file_id = ?
-	`, totalLines, time.Now().Format(time.RFC3339), fileID)
-	return err
-}
-
-// GetChunk 获取文件块
-func (db *DBManager) GetChunk(chunkID string) (*FileChunk, error) {
-	conn, err := db.getConnection()
-	if err != nil {
-		return nil, err
-	}
-	defer conn.Close()
-
-	var chunk FileChunk
-	var uploadFileID, batchID, uploadTime, processTime, errorMessage, batchTaskInfoJSON sql.NullString
-
-	err = conn.QueryRow(`
-		SELECT chunk_id, file_id, chunk_index, chunk_path, chunk_size,
-		       status, upload_file_id, batch_id, upload_time, process_time,
-		       error_message, batch_task_info, retry
-		FROM chunks WHERE chunk_id = ?
-	`, chunkID).Scan(
-		&chunk.ChunkID,
-		&chunk.FileID,
-		&chunk.ChunkIndex,
-		&chunk.ChunkPath,
-		&chunk.ChunkSize,
-		&chunk.Status,
-		&uploadFileID,
-		&batchID,
-		&uploadTime,
-		&processTime,
-		&errorMessage,
-		&batchTaskInfoJSON,
-		&chunk.Retry,
-	)
-	if err == sql.ErrNoRows {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-
-	if uploadFileID.Valid {
-		chunk.UploadFileID = &uploadFileID.String
-	}
-	if batchID.Valid {
-		chunk.BatchID = &batchID.String
-	}
-	if uploadTime.Valid {
-		chunk.UploadTime = &uploadTime.String
-	}
-	if processTime.Valid {
-		chunk.ProcessTime = &processTime.String
-	}
-	if errorMessage.Valid {
-		chunk.ErrorMessage = &errorMessage.String
-	}
-
-	// 解析 batch_task_info
-	if batchTaskInfoJSON.Valid && batchTaskInfoJSON.String != "" {
-		var batchTaskInfo BatchTaskInfo
-		if err := json.Unmarshal([]byte(batchTaskInfoJSON.String), &batchTaskInfo); err == nil {
-			chunk.BatchTaskInfo = &batchTaskInfo
-		}
-	}
-
-	return &chunk, nil
-}
-
-// AddChunk 添加文件块
-func (db *DBManager) AddChunk(chunk *FileChunk) error {
-	conn, err := db.getConnection()
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-
-	var batchTaskInfoJSON sql.NullString
-	if chunk.BatchTaskInfo != nil {
-		data, err := json.Marshal(chunk.BatchTaskInfo)
-		if err == nil {
-			batchTaskInfoJSON = sql.NullString{String: string(data), Valid: true}
-		}
-	}
-
-	_, err = conn.Exec(`
-		INSERT INTO chunks (
-			chunk_id, file_id, chunk_index, chunk_path,
-			chunk_size, status, upload_file_id, batch_id, upload_time, process_time, error_message, batch_task_info, retry
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`,
-		chunk.ChunkID,
-		chunk.FileID,
-		chunk.ChunkIndex,
-		chunk.ChunkPath,
-		chunk.ChunkSize,
-		string(chunk.Status),
-		chunk.UploadFileID,
-		chunk.BatchID,
-		chunk.UploadTime,
-		chunk.ProcessTime,
-		chunk.ErrorMessage,
-		batchTaskInfoJSON,
-		chunk.Retry,
-	)
-	return err
-}
-
-// UpdateChunkStatus 更新文件块状态
-func (db *DBManager) UpdateChunkStatus(chunkID string, status ChunkStatus, errorMessage *string) error {
-	conn, err := db.getConnection()
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-
-	now := time.Now().Format(time.RFC3339)
-	if status == ChunkStatusUploaded {
-		_, err = conn.Exec(`
-			UPDATE chunks 
-			SET status = ?, upload_time = ?, error_message = ?
-			WHERE chunk_id = ?
-		`, string(status), now, errorMessage, chunkID)
-	} else if status == ChunkStatusProcessed {
-		_, err = conn.Exec(`
-			UPDATE chunks 
-			SET status = ?, process_time = ?, error_message = ?
-			WHERE chunk_id = ?
-		`, string(status), now, errorMessage, chunkID)
-	} else {
-		_, err = conn.Exec(`
-			UPDATE chunks 
-			SET status = ?, error_message = ?
-			WHERE chunk_id = ?
-		`, string(status), errorMessage, chunkID)
-	}
-	return err
-}
-
-// UpdateChunkUploadFileID 更新文件块上传文件id
-func (db *DBManager) UpdateChunkUploadFileID(chunkID string, uploadFileID string) error {
-	conn, err := db.getConnection()
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-
-	now := time.Now().Format(time.RFC3339)
-	_, err = conn.Exec(`
-		UPDATE chunks 
-		SET upload_file_id = ?, upload_time = ?
-		WHERE chunk_id = ?
-	`, uploadFileID, now, chunkID)
-	return err
-}
-
-// UpdateChunkBatchID 更新文件块batch任务id
-func (db *DBManager) UpdateChunkBatchID(chunkID string, batchID string) error {
-	conn, err := db.getConnection()
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-
-	_, err = conn.Exec(`
-		UPDATE chunks 
-		SET batch_id = ?
-		WHERE chunk_id = ?
-	`, batchID, chunkID)
-	return err
-}
-
-// UpdateChunkBatchTaskInfo 更新文件块batch任务信息
-func (db *DBManager) UpdateChunkBatchTaskInfo(chunkID string, batchTaskInfo *BatchTaskInfo) error {
-	conn, err := db.getConnection()
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-
-	data, err := json.Marshal(batchTaskInfo)
-	if err != nil {
-		return err
-	}
-
-	_, err = conn.Exec(`
-		UPDATE chunks 
-		SET batch_task_info = ?
-		WHERE chunk_id = ?
-	`, string(data), chunkID)
-	return err
-}
-
-// DeleteFile 删除文件记录
-func (db *DBManager) DeleteFile(fileID string) error {
-	conn, err := db.getConnection()
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-
-	// 先删除文件块
-	_, err = conn.Exec(`DELETE FROM chunks WHERE file_id = ?`, fileID)
-	if err != nil {
-		return err
-	}
-
-	// 再删除文件
-	_, err = conn.Exec(`DELETE FROM files WHERE file_id = ?`, fileID)
-	return err
-}
-
-// GetPendingFiles 获取需要自动执行的文件列表（状态为split_completed或processing的文件）
-func (db *DBManager) GetPendingFiles() ([]string, error) {
-	conn, err := db.getConnection()
-	if err != nil {
-		return nil, err
-	}
-	defer conn.Close()
-
-	rows, err := conn.Query(`
-		SELECT file_id 
-		FROM files 
-		WHERE status IN (?, ?)
-		ORDER BY created_time ASC
-	`, string(FileStatusSplitCompleted), string(FileStatusProcessing))
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var fileIDs []string
+func (db *DBManager) GetFile(taskID string) (*FileInfo, error) {
+	
+	conn, err := db.getConnection(); if err != nil { return nil, err }; defer conn.Close()
+	f := &FileInfo{}; var mergedPath, errMsg sql.NullString
+	err = conn.QueryRow(`SELECT task_id, original_filename, file_path, file_size, total_chunks, total_lines, status, created_time, updated_time, retry, max_retry, merged_path, error_message FROM files WHERE task_id = ?`, taskID).Scan(&f.TaskID, &f.OriginalFilename, &f.FilePath, &f.FileSize, &f.TotalChunks, &f.TotalLines, &f.Status, &f.CreatedTime, &f.UpdatedTime, &f.Retry, &f.MaxRetry, &mergedPath, &errMsg)
+	if err != nil { return nil, err }
+	f.MergedPath = mergedPath.String; f.ErrorMessage = errMsg.String; f.Chunks = []*FileChunk{}
+	rows, err := conn.Query(`SELECT chunk_id, chunk_index, chunk_path, chunk_size, status, upload_file_id, batch_id, upload_time, process_time, error_message, batch_task_info, retry FROM chunks WHERE task_id = ? ORDER BY chunk_index ASC`, taskID)
+	if err != nil { return f, nil }; defer rows.Close()
 	for rows.Next() {
-		var fileID string
-		if err := rows.Scan(&fileID); err == nil {
-			fileIDs = append(fileIDs, fileID)
-		}
+		c := &FileChunk{TaskID: taskID}; var uid, bid, uTime, pTime, eMsg, bInfo sql.NullString
+		rows.Scan(&c.ChunkID, &c.ChunkIndex, &c.ChunkPath, &c.ChunkSize, &c.Status, &uid, &bid, &uTime, &pTime, &eMsg, &bInfo, &c.Retry)
+		if uid.Valid { s := uid.String; c.UploadFileID = &s }
+		if bid.Valid { s := bid.String; c.BatchID = &s }
+		c.UploadTime = uTime.String; c.ProcessTime = pTime.String; c.ErrorMessage = eMsg.String
+		if bInfo.Valid && bInfo.String != "" { json.Unmarshal([]byte(bInfo.String), &c.BatchTaskInfo) }
+		f.Chunks = append(f.Chunks, c)
 	}
+	db.mu.Lock(); db.files[taskID] = f; db.mu.Unlock()
+	return f, nil
+}
 
-	return fileIDs, nil
+func (db *DBManager) GetAllFiles() ([]*FileInfo, error) {
+	conn, err := db.getConnection(); if err != nil { return nil, err }; defer conn.Close()
+	rows, err := conn.Query(`SELECT task_id FROM files ORDER BY created_time DESC`)
+	if err != nil { return nil, err }; defer rows.Close()
+	var files []*FileInfo
+	for rows.Next() {
+		var id string; rows.Scan(&id)
+		if f, _ := db.GetFile(id); f != nil { files = append(files, f) }
+	}
+	return files, nil
+}
+
+func (db *DBManager) UpdateFileStatus(id string, status FileStatus, errInfo *string) error {
+	conn, err := db.getConnection(); if err != nil { return err }; defer conn.Close()
+	if errInfo != nil {
+		_, err = conn.Exec(`UPDATE files SET status = ?, error_message = ?, updated_time = ? WHERE task_id = ?`, status, *errInfo, time.Now().Format(time.RFC3339), id)
+	} else {
+		_, err = conn.Exec(`UPDATE files SET status = ?, updated_time = ? WHERE task_id = ?`, status, time.Now().Format(time.RFC3339), id)
+	}
+	return err
+}
+
+func (db *DBManager) UpdateFileRetry(id string, retry int) error {
+	conn, _ := db.getConnection(); defer conn.Close(); _, err := conn.Exec(`UPDATE files SET retry = ? WHERE task_id = ?`, retry, id); return err
+}
+func (db *DBManager) UpdateFileTotalChunks(id string, n int) error {
+	conn, _ := db.getConnection(); defer conn.Close(); _, err := conn.Exec(`UPDATE files SET total_chunks = ? WHERE task_id = ?`, n, id); return err
+}
+func (db *DBManager) UpdateFileTotalLines(id string, n int) error {
+	conn, _ := db.getConnection(); defer conn.Close(); _, err := conn.Exec(`UPDATE files SET total_lines = ? WHERE task_id = ?`, n, id); return err
+}
+
+func (db *DBManager) GetChunk(chunkID string) (*FileChunk, error) {
+	conn, _ := db.getConnection(); defer conn.Close()
+	c := &FileChunk{ChunkID: chunkID}; var uid, bid, bInfo sql.NullString
+	err := conn.QueryRow(`SELECT task_id, chunk_index, chunk_path, status, upload_file_id, batch_id, batch_task_info, retry FROM chunks WHERE chunk_id = ?`, chunkID).Scan(&c.TaskID, &c.ChunkIndex, &c.ChunkPath, &c.Status, &uid, &bid, &bInfo, &c.Retry)
+	if err != nil { return nil, err }
+	if uid.Valid { s := uid.String; c.UploadFileID = &s }
+	if bid.Valid { s := bid.String; c.BatchID = &s }
+	if bInfo.Valid && bInfo.String != "" { json.Unmarshal([]byte(bInfo.String), &c.BatchTaskInfo) }
+	return c, nil
+}
+
+func (db *DBManager) UpdateChunkStatus(id string, status ChunkStatus, msg *string) error {
+	conn, _ := db.getConnection(); defer conn.Close()
+	if msg != nil { _, err := conn.Exec(`UPDATE chunks SET status = ?, error_message = ? WHERE chunk_id = ?`, status, *msg, id); return err }
+	_, err := conn.Exec(`UPDATE chunks SET status = ? WHERE chunk_id = ?`, status, id); return err
+}
+func (db *DBManager) UpdateChunkUploadSuccess(cid string, uid string) error {
+	conn, _ := db.getConnection(); defer conn.Close(); _, err := conn.Exec(`UPDATE chunks SET status = 'uploaded', upload_file_id = ?, upload_time = ? WHERE chunk_id = ?`, uid, time.Now().Format(time.RFC3339), cid); return err
+}
+func (db *DBManager) UpdateChunkBatchID(cid string, bid string) error {
+	conn, _ := db.getConnection(); defer conn.Close(); _, err := conn.Exec(`UPDATE chunks SET batch_id = ? WHERE chunk_id = ?`, bid, cid); return err
+}
+func (db *DBManager) UpdateChunkBatchTaskInfo(cid string, info *BatchTaskInfo) error {
+	conn, _ := db.getConnection(); defer conn.Close(); data, _ := json.Marshal(info); _, err := conn.Exec(`UPDATE chunks SET batch_task_info = ?, process_time = ? WHERE chunk_id = ?`, string(data), time.Now().Format(time.RFC3339), cid); return err
+}
+
+// 【新增】ForceCancelTask 强制终止任务
+func (db *DBManager) ForceCancelTask(taskID string, reason string) error {
+	conn, err := db.getConnection(); if err != nil { return err }; defer conn.Close()
+	// 1. 文件标记为 Canceled
+	conn.Exec(`UPDATE files SET status = ?, error_message = ?, updated_time = ? WHERE task_id = ?`, FileStatusCanceled, reason, time.Now().Format(time.RFC3339), taskID)
+	// 2. 将所有未完成分块强制 Canceled
+	conn.Exec(`UPDATE chunks SET status = ? WHERE task_id = ? AND status NOT IN (?, ?)`, ChunkStatusCanceled, taskID, ChunkStatusSuccess, ChunkStatusFailed)
+	return nil
 }

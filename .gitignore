@@ -1,0 +1,17 @@
+﻿# 运行时目录
+chunks/
+merged/
+logs/
+log/
+batch_result/
+
+# 数据文件
+*.jsonl
+*.csv
+*.db
+*.log
+*.exe
+
+# 临时文件
+file_status.db
+invalid_records.jsonl
