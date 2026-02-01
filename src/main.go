@@ -9,258 +9,11 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
-	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
-
-	"golang.org/x/term"
 )
-
-// ProgressDisplay 进度显示类
-type ProgressDisplay struct{}
-
-// Update 更新显示
-func (p *ProgressDisplay) Update(message string) {
-	// 直接使用 log.Print 而不是 logInfo，避免格式化问题
-	// 因为 message 可能包含 % 字符（如进度条中的百分比）
-	if infoLogger != nil {
-		infoLogger.Print(message)
-		if logFile != nil {
-			logFile.Sync()
-		}
-	}
-}
-
-// GetDisplayWidth 计算字符串在终端中的显示宽度（中文字符占2个字符宽度）
-// 注意：Unicode 块字符（如 █、▌）在终端中通常只占1个字符宽度，不是2个
-func (p *ProgressDisplay) GetDisplayWidth(text string) int {
-	width := 0
-	for _, char := range text {
-		// Unicode 块字符范围：U+2580-U+259F，这些字符在终端中占1个字符宽度
-		if char >= 0x2580 && char <= 0x259F {
-			width += 1
-		} else if char > 127 {
-			// 其他非ASCII字符（如中文）占2个字符宽度
-			width += 2
-		} else {
-			width += 1
-		}
-	}
-	return width
-}
-
-// CalcProgress 计算进度条
-func (p *ProgressDisplay) CalcProgress(prefix string, finishCount int, totalCount int) string {
-	terminalWidth := 120
-
-	// 尝试获取终端宽度
-	if runtime.GOOS == "windows" {
-		width, _, err := term.GetSize(int(os.Stdout.Fd()))
-		if err == nil && width > 0 {
-			terminalWidth = width
-		}
-		// break
-		// // Windows: 尝试使用 mode con 获取终端宽度
-		// cmd := exec.Command("cmd", "/c", "mode", "con")
-		// output, err := cmd.Output()
-		// if err == nil {
-		// 	outputStr := string(output)
-		// 	// 查找 "列:" 或 "Columns:" 后面的数字
-		// 	// 格式可能是: "列: 120" 或 "Columns: 120"
-		// 	lines := strings.Split(outputStr, "\n")
-		// 	for _, line := range lines {
-		// 		line = strings.TrimSpace(line)
-		// 		// 查找包含列数的行
-		// 		if idx := strings.Index(line, "列:"); idx >= 0 {
-		// 			// 中文系统
-		// 			rest := strings.TrimSpace(line[idx+len("列:"):])
-		// 			if w, err := strconv.Atoi(strings.Fields(rest)[0]); err == nil && w > 0 {
-		// 				terminalWidth = w
-		// 				break
-		// 			}
-		// 		} else if idx := strings.Index(line, "Columns:"); idx >= 0 {
-		// 			// 英文系统
-		// 			rest := strings.TrimSpace(line[idx+len("Columns:"):])
-		// 			if w, err := strconv.Atoi(strings.Fields(rest)[0]); err == nil && w > 0 {
-		// 				terminalWidth = w
-		// 				break
-		// 			}
-		// 		}
-		// 	}
-		// }
-		// 如果获取失败，使用默认值 120（现代终端通常更宽）
-		// if terminalWidth == 80 {
-		// 	terminalWidth = 120
-		// }
-	} else {
-		// Unix: 使用 stty 获取终端宽度
-		cmd := exec.Command("stty", "size")
-		cmd.Stdin = os.Stdin
-		if output, err := cmd.Output(); err == nil {
-			parts := strings.Fields(string(output))
-			if len(parts) >= 2 {
-				if w, err := strconv.Atoi(parts[1]); err == nil && w > 0 {
-					terminalWidth = w
-				}
-			}
-		}
-	}
-
-	// 计算进度百分比
-	var progressPercent float64
-	if totalCount > 0 {
-		progressPercent = float64(finishCount) / float64(totalCount) * 100
-	}
-
-	// 左侧部分：百分比 + 竖线
-	// 使用 %d 格式化整数百分比，%% 转义为单个 %
-	percentInt := int(progressPercent)
-	// 直接拼接字符串，避免格式化问题
-	leftPart := fmt.Sprintf("%d", percentInt) + "%|"
-
-	// 右侧部分：竖线 + 已完成数/总数
-	rightPart := fmt.Sprintf("|%d/%d", finishCount, totalCount)
-
-	// 计算各部分显示宽度（统一使用显示宽度，不是字节数）
-	prefixWidth := p.GetDisplayWidth(prefix)
-	leftWidth := p.GetDisplayWidth(leftPart)
-	rightWidth := p.GetDisplayWidth(rightPart)
-
-	// 计算中间进度条的可用宽度
-	progressWidth := terminalWidth - leftWidth - rightWidth - prefixWidth
-	if progressWidth < 10 {
-		progressWidth = 10
-	}
-
-	// 每个进度块 "█▌" 在终端中占2个字符宽度（每个字符占1个宽度）
-	blockSize := p.GetDisplayWidth("█▌") // 应该是 2
-	maxBlocks := progressWidth / blockSize
-
-	// 计算已完成的块数量
-	var filledBlocks int
-	var partialProgress float64
-	if totalCount > 0 {
-		filledBlocks = int(float64(finishCount) / float64(totalCount) * float64(maxBlocks))
-		partialProgress = float64(finishCount)/float64(totalCount)*float64(maxBlocks) - float64(filledBlocks)
-	}
-
-	// 构建进度条
-	progressBar := strings.Repeat("█▌", filledBlocks)
-
-	// 添加部分完成的块（如果有）
-	if partialProgress > 0.2 {
-		progressBar += "▌"
-	}
-
-	// 计算剩余的空格数（使用显示宽度，不是字节数）
-	// 使用 GetDisplayWidth 准确计算进度条的显示宽度
-	usedDisplayWidth := p.GetDisplayWidth(progressBar)
-	remainingSpaces := progressWidth - usedDisplayWidth
-
-	// 添加所有空格到后面
-	if remainingSpaces > 0 {
-		progressBar += strings.Repeat(" ", remainingSpaces)
-	} else if remainingSpaces < 0 {
-		// 如果超出，需要截断进度条
-		// 由于进度条字符是Unicode，需要按显示宽度截断
-		if progressWidth > 0 {
-			// 逐步减少块数，直到宽度合适
-			for p.GetDisplayWidth(progressBar) > progressWidth {
-				if len(progressBar) >= 2 {
-					progressBar = progressBar[:len(progressBar)-2] // 移除最后一个 "█▌"
-				} else {
-					break
-				}
-			}
-			// 如果还有空间，尝试添加部分块
-			currentWidth := p.GetDisplayWidth(progressBar)
-			if currentWidth < progressWidth && partialProgress > 0.2 {
-				// 检查是否可以添加 "▌"
-				testBar := progressBar + "▌"
-				if p.GetDisplayWidth(testBar) <= progressWidth {
-					progressBar = testBar
-				}
-			}
-			// 最后确保宽度正确
-			currentWidth = p.GetDisplayWidth(progressBar)
-			if currentWidth < progressWidth {
-				progressBar += strings.Repeat(" ", progressWidth-currentWidth)
-			}
-		}
-	}
-
-	// 组合：prefix + 百分比|进度条|已完成/总数
-	// 使用字符串拼接而不是 fmt.Sprintf，避免格式化问题
-	logInfo("prefix: %d, leftPart: %d, progressBar: %d, rightPart: %d", prefixWidth, leftWidth, p.GetDisplayWidth(progressBar), rightWidth)
-	return prefix + leftPart + progressBar + rightPart
-}
-
-// ShowStatus 显示文件状态
-func (p *ProgressDisplay) ShowStatus(fileInfo *FileInfo, clearScreen bool) {
-	summary := fileInfo.GetStatusSummary()
-	total := summary.Total
-
-	statusMsg := fmt.Sprintf("\n 文件: %s | file_id: %s \n 总块数: %d | 待上传：%d | 已上传: %d | 处理中: %d | 已处理: %d | 上传失败: %d \n 总处理行数: %d | 已完成行数: %d | 失败行数: %d | 重试次数: %d次",
-		fileInfo.OriginalFilename, fileInfo.FileID, summary.TotalChunks,
-		total["pending"], total["uploaded"], total["processing"], total["processed"], total["upload_failed"],
-		fileInfo.TotalLines, total["complete_count"], total["failed_count"], fileInfo.Retry)
-
-	// 计算进度条
-	totalCount := fileInfo.TotalLines
-	completeCount := total["complete_count"]
-	statusMsg += "\n"
-	statusMsg += p.CalcProgress("已完成占比：", completeCount, totalCount)
-
-	processingTrunks := summary.ProcessingTrunks
-
-	// 迭代显示每个处理中块的进度
-	if len(processingTrunks) > 0 {
-		// 排序chunk_id以便显示
-		chunkIDs := make([]string, 0, len(processingTrunks))
-		for chunkID := range processingTrunks {
-			chunkIDs = append(chunkIDs, chunkID)
-		}
-		sort.Strings(chunkIDs)
-
-		for _, chunkID := range chunkIDs {
-			trunkInfo := processingTrunks[chunkID]
-			trunkTotal := trunkInfo["total_count"]
-			trunkComplete := trunkInfo["complete_count"]
-			trunkFailed := trunkInfo["failed_count"]
-			// 显示块ID和进度条
-			statusMsg += "\n"
-			statusMsg += p.CalcProgress(fmt.Sprintf("%s 完成进度: ", chunkID), trunkComplete+trunkFailed, trunkTotal)
-		}
-	}
-
-	// 根据参数决定是否清屏并显示状态
-	if clearScreen {
-		clearScreenFunc()
-	}
-	p.Update(statusMsg)
-}
-
-// ShowSimpleFileInfo 显示简化的文件信息（只显示文件名、file_id、创建时间、当前状态）
-func (p *ProgressDisplay) ShowSimpleFileInfo(fileInfo *FileInfo) {
-	statusMsg := fmt.Sprintf("文件名: %s | file_id: %s | 创建时间: %s | 当前状态: %s",
-		fileInfo.OriginalFilename, fileInfo.FileID, fileInfo.CreatedTime, fileInfo.Status)
-	p.Update(statusMsg)
-}
-
-// clearScreenFunc 清屏
-func clearScreenFunc() {
-	var cmd *exec.Cmd
-	if runtime.GOOS == "windows" {
-		cmd = exec.Command("cmd", "/c", "cls")
-	} else {
-		cmd = exec.Command("clear")
-	}
-	cmd.Stdout = os.Stdout
-	cmd.Run()
-}
 
 // BatchInferService 批量推理服务主类
 type BatchInferService struct {
@@ -285,22 +38,22 @@ func NewBatchInferService() *BatchInferService {
 		fileManager:     fileManager,
 		batchManager:    batchManager,
 		chunkManager:    chunkManager,
-		progress:        &ProgressDisplay{},
+		progress:        NewProgressDisPlay(),
 		processingFiles: make(map[string]bool),
 	}
 }
 
 // ValidateFileExists 验证文件是否存在
-func (bis *BatchInferService) ValidateFileExists(fileID string) (*FileInfo, error) {
-	fileInfo, err := bis.dbManager.GetFile(fileID)
+func (bis *BatchInferService) ValidateFileExists(taskID string) (*FileInfo, error) {
+	fileInfo, err := bis.dbManager.GetFile(taskID)
 	if err != nil || fileInfo == nil {
-		return nil, fmt.Errorf("文件不存在: %s", fileID)
+		return nil, fmt.Errorf("文件不存在: %s", taskID)
 	}
 	return fileInfo, nil
 }
 
 // SplitFile 分割文件
-func (bis *BatchInferService) SplitFile(filePath string, linesPerChunk *int) (string, error) {
+func (bis *BatchInferService) SplitFile(filePath string, taskId string, linesPerChunk *int) (string, error) {
 	if _, err := os.Stat(filePath); os.IsNotExist(err) {
 		return "", fmt.Errorf("文件不存在: %s", filePath)
 	}
@@ -313,20 +66,20 @@ func (bis *BatchInferService) SplitFile(filePath string, linesPerChunk *int) (st
 	filename := filepath.Base(filePath)
 	bis.progress.Update(fmt.Sprintf("开始分割文件: %s (每块行数: %d)", filename, lines))
 
-	fileInfo, err := bis.fileManager.SplitFile(filePath, filename, lines)
+	fileInfo, err := bis.fileManager.SplitFile(filePath, filename, taskId, lines)
 	if err != nil {
 		bis.progress.Update(fmt.Sprintf("✗ 文件分割失败: %v", err))
 		return "", err
 	}
 
-	bis.progress.Update(fmt.Sprintf("✓ 文件分割完成: %s", fileInfo.FileID))
+	bis.progress.Update(fmt.Sprintf("✓ 文件分割完成: %s", fileInfo.TaskID))
 	bis.progress.ShowStatus(fileInfo, true)
-	return fileInfo.FileID, nil
+	return fileInfo.TaskID, nil
 }
 
 // UploadChunks 上传文件块（无并发限制）
-func (bis *BatchInferService) UploadChunks(fileID string) int {
-	fileInfo, err := bis.ValidateFileExists(fileID)
+func (bis *BatchInferService) UploadChunks(taskID string) int {
+	fileInfo, err := bis.ValidateFileExists(taskID)
 	if err != nil {
 		return 0
 	}
@@ -363,7 +116,7 @@ func (bis *BatchInferService) UploadChunks(fileID string) int {
 	}
 
 	if uploadedCount > 0 && fileInfo.Status == FileStatusSplitCompleted {
-		bis.dbManager.UpdateFileStatus(fileID, FileStatusProcessing, nil)
+		bis.dbManager.UpdateFileStatus(taskID, FileStatusProcessing, nil)
 		fileInfo.Status = FileStatusProcessing
 	}
 
@@ -371,8 +124,8 @@ func (bis *BatchInferService) UploadChunks(fileID string) int {
 }
 
 // StartChunkProcess 启动batch任务（无并发限制）
-func (bis *BatchInferService) StartChunkProcess(fileID string) int {
-	fileInfo, err := bis.ValidateFileExists(fileID)
+func (bis *BatchInferService) StartChunkProcess(taskID string) int {
+	fileInfo, err := bis.ValidateFileExists(taskID)
 	if err != nil {
 		return 0
 	}
@@ -397,8 +150,8 @@ func (bis *BatchInferService) StartChunkProcess(fileID string) int {
 }
 
 // CheckChunkProcess 检查batch任务
-func (bis *BatchInferService) CheckChunkProcess(fileID string) int {
-	fileInfo, err := bis.ValidateFileExists(fileID)
+func (bis *BatchInferService) CheckChunkProcess(taskID string) int {
+	fileInfo, err := bis.ValidateFileExists(taskID)
 	if err != nil {
 		return 0
 	}
@@ -422,8 +175,8 @@ func (bis *BatchInferService) CheckChunkProcess(fileID string) int {
 }
 
 // UploadAndProcessLoop 循环执行上传、处理和检查
-func (bis *BatchInferService) UploadAndProcessLoop(fileID string) {
-	fileInfo, err := bis.ValidateFileExists(fileID)
+func (bis *BatchInferService) UploadAndProcessLoop(taskID string) {
+	fileInfo, err := bis.ValidateFileExists(taskID)
 	if err != nil {
 		return
 	}
@@ -432,7 +185,7 @@ func (bis *BatchInferService) UploadAndProcessLoop(fileID string) {
 
 	for {
 		// 刷新文件信息
-		fileInfo, err = bis.dbManager.GetFile(fileID)
+		fileInfo, err = bis.dbManager.GetFile(taskID)
 		if err != nil || fileInfo == nil {
 			break
 		}
@@ -470,7 +223,7 @@ func (bis *BatchInferService) UploadAndProcessLoop(fileID string) {
 
 		// 1. 检查正在处理的chunk状态
 		if processingCount > 0 {
-			completedCount := bis.CheckChunkProcess(fileID)
+			completedCount := bis.CheckChunkProcess(taskID)
 			if completedCount > 0 {
 				processingCount -= completedCount
 				processedCount += completedCount
@@ -478,9 +231,9 @@ func (bis *BatchInferService) UploadAndProcessLoop(fileID string) {
 		}
 
 		// 无并发限制，直接上传和处理所有可用的chunk
-		if pendingCount+uploadedCount > 0 {
-			bis.UploadChunks(fileID)
-			bis.StartChunkProcess(fileID)
+		if pendingCount+uploadedCount+failedCount > 0 {
+			bis.UploadChunks(taskID)
+			bis.StartChunkProcess(taskID)
 		}
 
 		// 等待一段时间后再次检查
@@ -489,8 +242,8 @@ func (bis *BatchInferService) UploadAndProcessLoop(fileID string) {
 }
 
 // MergeFile 合并文件
-func (bis *BatchInferService) MergeFile(fileID string) (map[string]interface{}, error) {
-	fileInfo, err := bis.ValidateFileExists(fileID)
+func (bis *BatchInferService) MergeFile(taskID string) (map[string]interface{}, error) {
+	fileInfo, err := bis.ValidateFileExists(taskID)
 	if err != nil {
 		return nil, err
 	}
@@ -528,9 +281,9 @@ func (bis *BatchInferService) MergeFile(fileID string) (map[string]interface{}, 
 		return nil, fmt.Errorf(errorMsg)
 	}
 
-	bis.progress.Update(fmt.Sprintf("开始合并文件: %s", fileID))
+	bis.progress.Update(fmt.Sprintf("开始合并文件: %s", taskID))
 
-	mergedDict, err := bis.fileManager.MergeBatchResults(fileID, fileInfo.Retry)
+	mergedDict, err := bis.fileManager.MergeBatchResults(taskID, fileInfo.Retry)
 	if err != nil {
 		bis.progress.Update(fmt.Sprintf("✗ 文件合并失败: %v", err))
 		return nil, err
@@ -539,7 +292,7 @@ func (bis *BatchInferService) MergeFile(fileID string) (map[string]interface{}, 
 	bis.progress.Update(fmt.Sprintf("✓ 文件合并完成: %v", mergedDict))
 
 	// 显示最终状态
-	fileInfo, _ = bis.dbManager.GetFile(fileID)
+	fileInfo, _ = bis.dbManager.GetFile(taskID)
 	if fileInfo != nil {
 		bis.progress.ShowStatus(fileInfo, true)
 	}
@@ -548,15 +301,15 @@ func (bis *BatchInferService) MergeFile(fileID string) (map[string]interface{}, 
 }
 
 // Cancel 终止调度
-func (bis *BatchInferService) Cancel(fileID string) {
-	fileInfo, err := bis.ValidateFileExists(fileID)
+func (bis *BatchInferService) Cancel(taskID string) {
+	fileInfo, err := bis.ValidateFileExists(taskID)
 	if err != nil {
 		return
 	}
 
 	// 将file_info的状态设置成canceled
-	bis.dbManager.UpdateFileStatus(fileID, FileStatusCanceled, nil)
-	bis.progress.Update(fmt.Sprintf("文件状态已设置为 CANCELED: %s", fileID))
+	bis.dbManager.UpdateFileStatus(taskID, FileStatusCanceled, nil)
+	bis.progress.Update(fmt.Sprintf("文件状态已设置为 CANCELED: %s", taskID))
 
 	// 对processing的chunk调用cancelBatchTask
 	for _, chunk := range fileInfo.Chunks {
@@ -579,43 +332,43 @@ func (bis *BatchInferService) Cancel(fileID string) {
 	}
 
 	// 刷新并显示状态
-	fileInfo, _ = bis.dbManager.GetFile(fileID)
+	fileInfo, _ = bis.dbManager.GetFile(taskID)
 	if fileInfo != nil {
 		bis.progress.ShowStatus(fileInfo, true)
 	}
-	bis.progress.Update(fmt.Sprintf("✓ 文件调度已终止: %s", fileID))
+	bis.progress.Update(fmt.Sprintf("✓ 文件调度已终止: %s", taskID))
 }
 
 // QueryStatus 查询并更新文件状态
-func (bis *BatchInferService) QueryStatus(fileID string) {
-	fileInfo, err := bis.ValidateFileExists(fileID)
+func (bis *BatchInferService) QueryStatus(taskID string) {
+	fileInfo, err := bis.ValidateFileExists(taskID)
 	if err != nil {
 		return
 	}
 
-	fileInfo, _ = bis.dbManager.GetFile(fileID)
+	fileInfo, _ = bis.dbManager.GetFile(taskID)
 	if fileInfo != nil {
 		bis.progress.ShowStatus(fileInfo, true)
 	}
 }
 
 // MonitorStatus 监控文件状态
-// 如果 fileID 为空，显示所有分割完成且进行中的文件列表及进度信息
-// 如果传入 fileID，查询单个文件进度
+// 如果 taskID 为空，显示所有分割完成且进行中的文件列表及进度信息
+// 如果传入 taskID，查询单个文件进度
 // 刷新间隔固定为 10 秒
-func (bis *BatchInferService) MonitorStatus(fileID string) {
-	if fileID == "" {
+func (bis *BatchInferService) MonitorStatus(taskID string) {
+	if taskID == "" {
 		// 显示所有进行中的文件
 		bis.MonitorAllFiles()
 	} else {
 		// 监控单个文件
-		bis.MonitorSingleFile(fileID)
+		bis.MonitorSingleFile(taskID)
 	}
 }
 
 // MonitorSingleFile 监控单个文件状态（固定刷新间隔10秒）
-func (bis *BatchInferService) MonitorSingleFile(fileID string) {
-	fmt.Printf("开始监控文件状态: %s (刷新间隔: 10秒)\n", fileID)
+func (bis *BatchInferService) MonitorSingleFile(taskID string) {
+	fmt.Printf("开始监控文件状态: %s (刷新间隔: 10秒)\n", taskID)
 	fmt.Println("按 Ctrl+C 停止监控\n")
 
 	ticker := time.NewTicker(10 * time.Second)
@@ -624,9 +377,9 @@ func (bis *BatchInferService) MonitorSingleFile(fileID string) {
 	for {
 		select {
 		case <-ticker.C:
-			fileInfo, err := bis.dbManager.GetFile(fileID)
+			fileInfo, err := bis.dbManager.GetFile(taskID)
 			if err != nil || fileInfo == nil {
-				fmt.Printf("文件不存在: %s\n", fileID)
+				fmt.Printf("文件不存在: %s\n", taskID)
 				return
 			}
 
@@ -663,7 +416,7 @@ func (bis *BatchInferService) MonitorAllFiles() {
 		select {
 		case <-ticker.C:
 			// 获取所有进行中的文件（分割完成或处理中）
-			fileIDs, err := bis.dbManager.GetPendingFiles()
+			taskIDs, err := bis.dbManager.GetPendingFiles()
 			if err != nil {
 				fmt.Printf("获取文件列表失败: %v\n", err)
 				continue
@@ -672,16 +425,16 @@ func (bis *BatchInferService) MonitorAllFiles() {
 			// 清屏
 			clearScreenFunc()
 			fmt.Printf("=== 所有进行中的文件监控 ===\n\n")
-			fmt.Printf("文件总数: %d\n\n", len(fileIDs))
+			fmt.Printf("文件总数: %d\n\n", len(taskIDs))
 
-			if len(fileIDs) == 0 {
+			if len(taskIDs) == 0 {
 				fmt.Println("当前没有进行中的文件")
 				continue
 			}
 
 			// 显示每个文件的状态
-			for _, fileID := range fileIDs {
-				fileInfo, err := bis.dbManager.GetFile(fileID)
+			for _, taskID := range taskIDs {
+				fileInfo, err := bis.dbManager.GetFile(taskID)
 				if err != nil || fileInfo == nil {
 					continue
 				}
@@ -692,15 +445,15 @@ func (bis *BatchInferService) MonitorAllFiles() {
 
 			// 检查是否所有文件都已完成
 			allCompleted := true
-			for _, fileID := range fileIDs {
-				fileInfo, _ := bis.dbManager.GetFile(fileID)
+			for _, taskID := range taskIDs {
+				fileInfo, _ := bis.dbManager.GetFile(taskID)
 				if fileInfo != nil && fileInfo.Status != FileStatusProcessCompleted && fileInfo.Status != FileStatusFailed && fileInfo.Status != FileStatusCanceled {
 					allCompleted = false
 					break
 				}
 			}
 
-			if allCompleted && len(fileIDs) > 0 {
+			if allCompleted && len(taskIDs) > 0 {
 				fmt.Println("\n✓ 所有文件处理完成！")
 				return
 			}
@@ -709,42 +462,41 @@ func (bis *BatchInferService) MonitorAllFiles() {
 }
 
 // RunPipeline 运行完整流程
-func (bis *BatchInferService) RunPipeline(filePathOrID string, linesPerChunk *int) {
-	var fileID string
+func (bis *BatchInferService) RunPipeline(filePath string, taskId string, linesPerChunk *int) {
+	var taskID string
 
-	// 判断传入的是文件路径还是 file_id
-	if _, err := os.Stat(filePathOrID); err == nil {
+	fileInfo, err := bis.dbManager.GetFile(taskId)
+	if err != nil {
+		logError("执行错误:%s", err)
+		os.Exit(1)
+	}
+	if fileInfo != nil {
+		logInfo("文件 %s 已存在", taskId)
+		return
+	}
+
+	if _, err := os.Stat(filePath); err == nil {
 		// 是文件路径，执行分割
 		logInfo("开始分割文件---------------------------")
 		var err error
-		fileID, err = bis.SplitFile(filePathOrID, linesPerChunk)
+		taskID, err = bis.SplitFile(filePath, taskId, linesPerChunk)
 		if err != nil {
 			logError("流程执行失败: %v", err)
 			os.Exit(1)
 		}
 	} else {
-		// 可能是 file_id，尝试查询
-		fileInfo, err := bis.dbManager.GetFile(filePathOrID)
-		if err == nil && fileInfo != nil {
-			// 是已存在的 file_id，跳过分割
-			fileID = filePathOrID
-			logInfo("使用已存在的文件ID: %s，跳过分割步骤", fileID)
-			bis.progress.Update(fmt.Sprintf("使用已存在的文件: %s (ID: %s)", fileInfo.OriginalFilename, fileID))
-		} else {
-			// 既不是文件路径，也不是有效的 file_id
-			logError("既不是有效的文件路径，也不是有效的文件ID: %s", filePathOrID)
-			os.Exit(1)
-		}
+		logError("文件错误:%s", err)
+		os.Exit(1)
 	}
 
 	for {
 		time.Sleep(10 * time.Second)
-		fileInfo, err := bis.dbManager.GetFile(fileID)
+		fileInfo, err := bis.dbManager.GetFile(taskID)
 		if err != nil {
 			continue
 		}
 		if fileInfo.Status == FileStatusProcessCompleted || fileInfo.Status == FileStatusFailed || fileInfo.Status == FileStatusCanceled {
-			logInfo("文件 %s 已结束，状态为 %s", fileID, fileInfo.Status)
+			logInfo("文件 %s 已结束，状态为 %s", taskID, fileInfo.Status)
 			break
 		}
 		bis.progress.ShowStatus(fileInfo, true)
@@ -753,30 +505,30 @@ func (bis *BatchInferService) RunPipeline(filePathOrID string, linesPerChunk *in
 }
 
 // ProcessFile 处理单个文件的完整流程（从上传到重试）
-func (bis *BatchInferService) ProcessFile(fileID string) {
+func (bis *BatchInferService) ProcessFile(taskID string) {
 	// 检查是否正在处理，如果是则跳过
 	bis.processingMutex.Lock()
-	if bis.processingFiles[fileID] {
+	if bis.processingFiles[taskID] {
 		bis.processingMutex.Unlock()
-		logInfo("文件 %s 正在处理中，跳过重复执行", fileID)
+		logInfo("文件 %s 正在处理中，跳过重复执行", taskID)
 		return
 	}
 	// 标记为正在处理
-	bis.processingFiles[fileID] = true
+	bis.processingFiles[taskID] = true
 	bis.processingMutex.Unlock()
 
 	// 确保处理完成后清除标记
 	defer func() {
 		bis.processingMutex.Lock()
-		delete(bis.processingFiles, fileID)
+		delete(bis.processingFiles, taskID)
 		bis.processingMutex.Unlock()
 	}()
 
-	logInfo("========== 开始处理文件: %s ==========", fileID)
+	logInfo("========== 开始处理文件: %s ==========", taskID)
 
-	fileInfo, err := bis.ValidateFileExists(fileID)
+	fileInfo, err := bis.ValidateFileExists(taskID)
 	if err != nil {
-		logError("文件验证失败 %s: %v", fileID, err)
+		logError("文件验证失败 %s: %v", taskID, err)
 		return
 	}
 
@@ -784,7 +536,7 @@ func (bis *BatchInferService) ProcessFile(fileID string) {
 	if fileInfo.Status == FileStatusProcessCompleted ||
 		fileInfo.Status == FileStatusCanceled ||
 		fileInfo.Status == FileStatusFailed {
-		logInfo("文件 %s 状态为 %s，跳过处理", fileID, fileInfo.Status)
+		logInfo("文件 %s 状态为 %s，跳过处理", taskID, fileInfo.Status)
 		return
 	}
 
@@ -792,38 +544,37 @@ func (bis *BatchInferService) ProcessFile(fileID string) {
 	// 使用文件表中的 max_retry 字段，而不是全局的 MAX_RETRY_COUNT
 	maxRetry := fileInfo.MaxRetry
 	for i := fileInfo.Retry; i <= maxRetry; i++ {
-		logInfo("[%s] 开始上传和处理文件块（循环执行）-------------------", fileID)
-		bis.UploadAndProcessLoop(fileID)
-		logInfo("[%s] 开始合并文件----------------------------", fileID)
-		_, err := bis.MergeFile(fileID)
+		logInfo("[%s] 开始上传和处理文件块（循环执行）-------------------", taskID)
+		bis.UploadAndProcessLoop(taskID)
+		logInfo("[%s] 开始合并文件----------------------------", taskID)
+		_, err := bis.MergeFile(taskID)
 		if err != nil {
-			logError("[%s] 合并文件失败: %v", fileID, err)
+			logError("[%s] 合并文件失败: %v", taskID, err)
 			break
 		}
-		logInfo("[%s] 检查失败数据---------------------------", fileID)
-		done, err := bis.fileManager.RetryFailedRecords(fileID)
+		logInfo("[%s] 检查失败数据---------------------------", taskID)
+		done, err := bis.fileManager.RetryFailedRecords(taskID)
 		if err != nil {
-			logError("[%s] 重试失败记录失败: %v", fileID, err)
+			logError("[%s] 重试失败记录失败: %v", taskID, err)
 			break
 		}
 		isDone = done
-		fileInfo, _ := bis.dbManager.GetFile(fileID)
+		fileInfo, _ := bis.dbManager.GetFile(taskID)
 		if fileInfo != nil {
 			bis.progress.ShowStatus(fileInfo, true)
 		}
 		if isDone {
-			logInfo("[%s] 完整流程执行结束！", fileID)
+			logInfo("[%s] 完整流程执行结束！", taskID)
 			break
 		}
 	}
 
-	logInfo("========== 文件处理完成: %s ==========", fileID)
+	logInfo("========== 文件处理完成: %s ==========", taskID)
 }
 
 // runDaemonLoop 守护进程的主循环（在独立的goroutine中运行）
 func (bis *BatchInferService) runDaemonLoop(ctx context.Context) {
 	logInfo("========== 守护进程已启动（后台运行）==========")
-	logInfo("扫描间隔: 60 秒")
 	if runtime.GOOS == "windows" {
 		logInfo("提示: 守护进程在后台运行，使用 taskkill /PID %d /F 命令停止", os.Getpid())
 	} else {
@@ -937,13 +688,8 @@ func (bis *BatchInferService) removeDaemonLock() {
 // RunDaemon 启动常驻进程（使用exec.Command启动独立进程）
 // 多次执行只启动一次，守护进程与主进程完全独立
 func (bis *BatchInferService) RunDaemon() {
-	logInfo("RunDaemon 函数被调用，interval: 60")
-
 	// 检查守护进程是否已经在运行
-	logInfo("开始检查守护进程是否在运行...")
 	isRunning := bis.checkDaemonRunning()
-	logInfo("守护进程检查结果: %v", isRunning)
-
 	if isRunning {
 		logInfo("守护进程已经在运行")
 		return
@@ -1014,9 +760,9 @@ func (bis *BatchInferService) RunDaemon() {
 		logInfo("守护进程已启动，进程ID: %d", cmd.Process.Pid)
 	}
 
-	logInfo("守护进程日志文件: %s", logFile)
-	logInfo("提示: 守护进程在后台独立运行，与当前进程无关")
-	logInfo("提示: 使用以下命令停止守护进程：")
+	// logInfo("守护进程日志文件: %s", logFile)
+	// logInfo("提示: 守护进程在后台独立运行，与当前进程无关")
+	// logInfo("提示: 使用以下命令停止守护进程：")
 	lockFile := filepath.Join(BASE_DIR, ".daemon.lock")
 	if data, err := os.ReadFile(lockFile); err == nil {
 		var pid int
@@ -1042,7 +788,7 @@ func (bis *BatchInferService) RunDaemon() {
 func (bis *BatchInferService) RunDaemonInternal() {
 	logInfo("========== 守护进程内部运行 ==========")
 	logInfo("进程ID: %d", os.Getpid())
-	logInfo("扫描间隔: 60 秒")
+	// logInfo("扫描间隔: 60 秒")
 
 	// 在守护进程中创建锁文件
 	lockFile := filepath.Join(BASE_DIR, ".daemon.lock")
@@ -1053,7 +799,7 @@ func (bis *BatchInferService) RunDaemonInternal() {
 	}
 	fmt.Fprintf(file, "%d", os.Getpid())
 	file.Close()
-	logInfo("已创建守护进程锁文件: %s (PID: %d)", lockFile, os.Getpid())
+	// logInfo("已创建守护进程锁文件: %s (PID: %d)", lockFile, os.Getpid())
 
 	// 确保退出时删除锁文件
 	defer func() {
@@ -1089,27 +835,27 @@ func (bis *BatchInferService) RunDaemonInternal() {
 func (bis *BatchInferService) processPendingFiles() {
 	logInfo("========== 开始扫描待处理文件 ==========")
 
-	fileIDs, err := bis.dbManager.GetPendingFiles()
+	taskIDs, err := bis.dbManager.GetPendingFiles()
 	if err != nil {
 		logError("获取待处理文件列表失败: %v", err)
 		return
 	}
 
-	if len(fileIDs) == 0 {
+	if len(taskIDs) == 0 {
 		logInfo("没有待处理的文件")
 		return
 	}
 
-	logInfo("找到 %d 个待处理文件", len(fileIDs))
+	logInfo("找到 %d 个待处理文件", len(taskIDs))
 
 	// 并行处理每个文件
 	var wg sync.WaitGroup
-	for _, fileID := range fileIDs {
+	for _, taskID := range taskIDs {
 		wg.Add(1)
 		go func(fid string) {
 			defer wg.Done()
 			bis.ProcessFile(fid)
-		}(fileID)
+		}(taskID)
 	}
 
 	// 等待所有文件处理完成
@@ -1119,10 +865,10 @@ func (bis *BatchInferService) processPendingFiles() {
 }
 
 // DeleteFile 删除文件
-func (bis *BatchInferService) DeleteFile(fileID string) {
-	if fileID != "" {
-		bis.dbManager.DeleteFile(fileID)
-		chunkDir := filepath.Join(CHUNK_DIR, fileID)
+func (bis *BatchInferService) DeleteFile(taskID string) {
+	if taskID != "" {
+		bis.dbManager.DeleteFile(taskID)
+		chunkDir := filepath.Join(CHUNK_DIR, taskID)
 		os.RemoveAll(chunkDir)
 	}
 }
@@ -1131,23 +877,18 @@ func main() {
 	initLogger()
 	logInfo("========== 程序启动 ==========")
 
-	// var pipeline, split, upload, process, merge, getFileInfo, cancel, monitor, deleteFile string
-	var pipeline, getFileInfo, cancel, monitor string
+	// var pipeline, split, upload, process, merge, taskId, cancel, monitor, deleteFile string
+	var pipeline, taskId, cancel, monitor string
 	var configPath string
 	var monitorProvided bool // 标记是否提供了 -monitor 参数
 	var daemonInternal bool
 
 	flag.StringVar(&configPath, "config", "", "模型配置文件路径（YAML格式），如果不指定则使用默认配置./config.yaml")
-	flag.StringVar(&pipeline, "pipeline", "", "运行完整流程（分割->上传->处理->合并->重试->结束）")
-	// flag.StringVar(&split, "split", "", "分割文件")
-	// flag.StringVar(&upload, "upload", "", "上传文件块")
-	// flag.StringVar(&process, "process", "", "处理文件块")
-	// flag.StringVar(&merge, "merge", "", "合并文件")
-	flag.StringVar(&getFileInfo, "file-info", "", "查询文件信息：all 则展示所有文件信息，否则通过文件名查询单个文件")
-	flag.StringVar(&cancel, "cancel", "", "终止调度：取消文件处理")
-	flag.StringVar(&monitor, "monitor", "", "监控文件状态，不传file_id则显示所有进行中的文件")
-	// flag.StringVar(&deleteFile, "delete-file", "", "删除文件及其块")
-	// flag.BoolVar(&daemon, "daemon", false, "启动常驻进程，自动处理待执行的文件")
+	flag.StringVar(&pipeline, "pipeline", "", "数据文件路径,运行完整流程（分割->上传->处理->合并->重试->结束）")
+	flag.StringVar(&taskId, "task-id", "", "pipeline 传参，task_id不能为空")
+	flag.StringVar(&cancel, "cancel", "", "具体task_id取消调度")
+	flag.StringVar(&monitor, "monitor", "", "监控文件状态，不传task_id则显示所有进行中的文件")
+
 	flag.BoolVar(&daemonInternal, "daemon-internal", false, "内部标志：守护进程内部运行（不要手动使用）")
 
 	// 自定义 Usage 函数，隐藏 daemon-internal 参数
@@ -1204,83 +945,21 @@ func main() {
 	case pipeline != "":
 		// 完整流程
 		logInfo("进入 pipeline case，参数: %s", pipeline)
-		service.RunPipeline(pipeline, nil)
-	// case split != "":
-	// 	// 分割文件
-	// 	logInfo("进入 split case，参数: %s", split)
-	// 	linesPerChunkPtr := &linesPerChunk
-	// 	if linesPerChunk == LINES_PER_CHUNK {
-	// 		linesPerChunkPtr = nil
-	// 	}
-	// 	fileID, err := service.SplitFile(split, linesPerChunkPtr)
-	// 	if err != nil {
-	// 		logError("错误: %v", err)
-	// 		os.Exit(1)
-	// 	}
-	// 	logInfo("文件ID: %s", fileID)
-	// case upload != "":
-	// 	// 上传文件块
-	// 	logInfo("进入 upload case，参数: %s", upload)
-	// 	service.UploadChunks(upload)
-	// case process != "":
-	// 	// 处理文件块
-	// 	logInfo("进入 process case，参数: %s", process)
-	// 	service.StartChunkProcess(process)
-	// case merge != "":
-	// 	// 合并文件
-	// 	logInfo("进入 merge case，参数: %s", merge)
-	// 	mergedPath, err := service.MergeFile(merge)
-	// 	if err != nil {
-	// 		logError("错误: %v", err)
-	// 		os.Exit(1)
-	// 	}
-	// 	logInfo("合并文件路径: %v", mergedPath)
-	case getFileInfo != "":
-		logInfo("进入 getFileInfo case，参数: %s", getFileInfo)
-		if getFileInfo == "all" {
-			// 查询所有文件，展示简化信息
-			files, err := service.dbManager.GetAllFiles()
-			if err != nil {
-				logError("查询所有文件失败: %v", err)
-			} else {
-				logInfo("=== 所有文件信息 ===")
-				for _, file := range files {
-					service.progress.ShowSimpleFileInfo(file)
-				}
-			}
-		} else {
-			// 通过文件名查询单个文件，展示简化信息
-			file, err := service.dbManager.GetFileByFilename(getFileInfo)
-			if err != nil {
-				logError("查询文件失败: %v", err)
-			} else if file == nil {
-				logError("文件不存在: %s", getFileInfo)
-			} else {
-				logInfo("=== 文件信息 ===")
-				service.progress.ShowSimpleFileInfo(file)
-			}
+		if taskId == "" {
+			logError("task-id 参数不能为空")
+			os.Exit(1)
 		}
+		service.RunPipeline(pipeline, taskId, nil)
 	case cancel != "":
 		// 终止调度
 		logInfo("进入 cancel case，参数: %s", cancel)
 		service.Cancel(cancel)
-	// case deleteFile != "":
-	// 	logInfo("进入 deleteFile case，参数: %s", deleteFile)
-	// 	service.DeleteFile(deleteFile)
 	case monitorProvided:
 		// 监控状态
 		// 如果 monitor 为空字符串，显示所有进行中的文件；否则显示指定文件
 		logInfo("进入 monitor case，参数: %s", monitor)
 		service.MonitorStatus(monitor)
-	// case daemon:
-	// 	// 启动常驻进程（在后台运行，固定间隔60秒）
-	// 	logInfo("进入 daemon case，准备调用 RunDaemon")
-	// 	service.RunDaemon()
-	// 	logInfo("RunDaemon 调用完成，准备退出")
-	// 	// 守护进程启动后，主进程可以退出
-	// 	return
 	default:
-		logInfo("进入 default case，显示使用说明")
 		flag.Usage()
 		os.Exit(1)
 	}

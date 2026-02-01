@@ -43,24 +43,25 @@ const (
 
 // FileChunk 文件块信息
 type FileChunk struct {
-	ChunkID       string         `json:"chunk_id"`
-	FileID        string         `json:"file_id"`
-	ChunkIndex    int            `json:"chunk_index"`
-	ChunkPath     string         `json:"chunk_path"`
-	ChunkSize     int            `json:"chunk_size"`
-	Status        ChunkStatus    `json:"status"`
-	UploadFileID  *string        `json:"upload_file_id,omitempty"`
-	BatchID       *string        `json:"batch_id,omitempty"`
-	UploadTime    *string        `json:"upload_time,omitempty"`
-	ProcessTime   *string        `json:"process_time,omitempty"`
-	ErrorMessage  *string        `json:"error_message,omitempty"`
-	BatchTaskInfo *BatchTaskInfo `json:"batch_task_info,omitempty"`
-	Retry         int            `json:"retry"`
+	ChunkID        string         `json:"chunk_id"`
+	TaskID         string         `json:"task_id"`
+	ChunkIndex     int            `json:"chunk_index"`
+	ChunkPath      string         `json:"chunk_path"`
+	ChunkSize      int            `json:"chunk_size"`
+	Status         ChunkStatus    `json:"status"`
+	UploadFileID   *string        `json:"upload_file_id,omitempty"`
+	BatchID        *string        `json:"batch_id,omitempty"`
+	UploadTime     *string        `json:"upload_time,omitempty"`
+	ProcessTime    *string        `json:"process_time,omitempty"`
+	BatchStartTime *string        `json:"batch_start_time,omitempty"`
+	ErrorMessage   *string        `json:"error_message,omitempty"`
+	BatchTaskInfo  *BatchTaskInfo `json:"batch_task_info,omitempty"`
+	Retry          int            `json:"retry"`
 }
 
 // FileInfo 文件信息
 type FileInfo struct {
-	FileID           string       `json:"file_id"`
+	TaskID           string       `json:"task_id"`
 	OriginalFilename string       `json:"original_filename"`
 	FilePath         string       `json:"file_path"`
 	FileSize         int64        `json:"file_size"`
@@ -97,10 +98,10 @@ func (b *BatchTaskInfo) IsFinished() bool {
 
 // StatusSummary 状态摘要
 type StatusSummary struct {
-	TotalChunks      int                       `json:"total_chunks"`
-	ByRetry          map[int]map[string]int    `json:"by_retry"`
-	Total            map[string]int            `json:"total"`
-	ProcessingTrunks map[string]map[string]int `json:"processing_trunks"`
+	TotalChunks      int                               `json:"total_chunks"`
+	ByRetry          map[int]map[string]int            `json:"by_retry"`
+	Total            map[string]int                    `json:"total"`
+	ProcessingTrunks map[string]map[string]interface{} `json:"processing_trunks"`
 }
 
 // GetStatusSummary 获取状态摘要
@@ -109,7 +110,7 @@ func (f *FileInfo) GetStatusSummary() *StatusSummary {
 		TotalChunks:      f.TotalChunks,
 		ByRetry:          make(map[int]map[string]int),
 		Total:            make(map[string]int),
-		ProcessingTrunks: make(map[string]map[string]int),
+		ProcessingTrunks: make(map[string]map[string]interface{}),
 	}
 
 	// 初始化总计
@@ -159,11 +160,17 @@ func (f *FileInfo) GetStatusSummary() *StatusSummary {
 					summary.Total["complete_count"] += chunk.BatchTaskInfo.CompletedCount
 					summary.Total["failed_count"] -= chunk.BatchTaskInfo.CompletedCount
 				}
-				summary.ProcessingTrunks[chunk.ChunkID] = map[string]int{
+				trunkInfo := map[string]interface{}{
 					"total_count":    chunk.BatchTaskInfo.TotalCount,
 					"complete_count": chunk.BatchTaskInfo.CompletedCount,
 					"failed_count":   chunk.BatchTaskInfo.FailedCount,
 				}
+				logInfo("chunk batch start time:%s", chunk.BatchStartTime)
+				// 添加 batch_start_time，转换为 int64 (Unix 时间戳)
+				if chunk.BatchStartTime != nil && *chunk.BatchStartTime != "" {
+					trunkInfo["batch_start_time"] = *chunk.BatchStartTime
+				}
+				summary.ProcessingTrunks[chunk.ChunkID] = trunkInfo
 			}
 		case ChunkStatusProcessed:
 			summary.ByRetry[retry]["processed"]++

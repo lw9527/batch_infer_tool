@@ -2,8 +2,8 @@ package main
 
 // ChunkManager Chunk管理器
 type ChunkManager struct {
-	dbManager   *DBManager
-	fileManager *FileManager
+	dbManager    *DBManager
+	fileManager  *FileManager
 	batchManager *BatchManager
 }
 
@@ -34,7 +34,7 @@ func (cm *ChunkManager) UploadChunk(chunkID string, fileData []byte) bool {
 			cm.dbManager.UpdateChunkStatus(chunkID, ChunkStatusUploadFailed, &errorMsg)
 			return false
 		}
-		
+
 		if err := cm.dbManager.UpdateChunkUploadFileID(chunkID, uploadFileID); err != nil {
 			logError("更新upload_file_id失败: %v", err)
 			return false
@@ -127,14 +127,14 @@ func (cm *ChunkManager) CheckChunkProcess(chunkID string) bool {
 		if result.OutputFileID != "" {
 			content, err := cm.batchManager.GetFileContent(result.OutputFileID)
 			if err == nil {
-				cm.fileManager.SaveFile(chunk.FileID, chunk.ChunkID, content, false)
+				cm.fileManager.SaveFile(chunk.TaskID, chunk.ChunkID, content, false)
 			}
 		}
 
 		if result.ErrorFileID != nil && *result.ErrorFileID != "" {
 			content, err := cm.batchManager.GetFileContent(*result.ErrorFileID)
 			if err == nil {
-				cm.fileManager.SaveFile(chunk.FileID, chunk.ChunkID, content, true)
+				cm.fileManager.SaveFile(chunk.TaskID, chunk.ChunkID, content, true)
 			}
 		}
 
@@ -148,4 +148,3 @@ func (cm *ChunkManager) CheckChunkProcess(chunkID string) bool {
 
 	return false
 }
-

@@ -26,12 +26,14 @@ var (
 
 // ModelConfig Model 配置结构
 type ModelConfig struct {
-	Domain      string   `yaml:"domain"`
-	MaxTokens   int      `yaml:"max_tokens"`
-	MessagesKey string   `yaml:"messages_key"`
-	Password    string   `yaml:"password"`
-	Temperature *float64 `yaml:"temperature"`
-	TopP        *float64 `yaml:"top_p"`
+	Domain         string                 `yaml:"domain"`
+	MaxTokens      int                    `yaml:"max_tokens"`
+	MessagesKey    string                 `yaml:"messages_key"`
+	Password       string                 `yaml:"password"`
+	Temperature    *float64               `yaml:"temperature"`
+	TopP           *float64               `yaml:"top_p"`
+	EnableThinking *bool                  `yaml:"enable_thinking"`
+	ExtraBody      map[string]interface{} `yaml:"extra_body"`
 }
 
 // Config 配置结构

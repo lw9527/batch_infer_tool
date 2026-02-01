@@ -8,9 +8,16 @@ model:
   messages_key: "messages"
   password: ""
   temperature: 0.6
+  extra_body: {
+    "stop": ["a", "b"],
+    "continue_final_message": true
+  }
+  enable_thinking: false
+  # stop: ["a", "b"]
+  # continue_final_message: true
 
 # 处理配置
-test_lines: 500        # 测试行数
+test_lines: 300        # 测试行数
 max_retry_count: 0    # 最大重试次数
 lines_per_chunk: 200 # 默认每个分块50000行，不能超过这个值
 

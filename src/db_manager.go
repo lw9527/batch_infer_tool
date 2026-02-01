@@ -78,6 +78,7 @@ func (db *DBManager) initDatabase() {
 			batch_id TEXT,
 			upload_time TEXT,
 			process_time TEXT,
+			batch_start_time TEXT,
 			error_message TEXT,
 			batch_task_info TEXT,
 			retry INTEGER DEFAULT 0,
@@ -105,7 +106,7 @@ func (db *DBManager) CreateFile(fileInfo *FileInfo) error {
 			merged_path, error_message, retry, max_retry
 		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
-		fileInfo.FileID,
+		fileInfo.TaskID,
 		fileInfo.OriginalFilename,
 		fileInfo.FilePath,
 		fileInfo.FileSize,
@@ -137,7 +138,7 @@ func (db *DBManager) GetFile(fileID string) (*FileInfo, error) {
 		       merged_path, error_message, retry, max_retry
 		FROM files WHERE file_id = ?
 	`, fileID).Scan(
-		&fileInfo.FileID,
+		&fileInfo.TaskID,
 		&fileInfo.OriginalFilename,
 		&fileInfo.FilePath,
 		&fileInfo.FileSize,
@@ -162,7 +163,7 @@ func (db *DBManager) GetFile(fileID string) (*FileInfo, error) {
 	rows, err := conn.Query(`
 		SELECT chunk_id, file_id, chunk_index, chunk_path, chunk_size,
 		       status, upload_file_id, batch_id, upload_time, process_time,
-		       error_message, batch_task_info, retry
+		       batch_start_time, error_message, batch_task_info, retry
 		FROM chunks WHERE file_id = ? ORDER BY chunk_index
 	`, fileID)
 	if err != nil {
@@ -173,11 +174,11 @@ func (db *DBManager) GetFile(fileID string) (*FileInfo, error) {
 	fileInfo.Chunks = []*FileChunk{}
 	for rows.Next() {
 		var chunk FileChunk
-		var uploadFileID, batchID, uploadTime, processTime, errorMessage, batchTaskInfoJSON sql.NullString
+		var uploadFileID, batchID, uploadTime, processTime, batchStartTime, errorMessage, batchTaskInfoJSON sql.NullString
 
 		err := rows.Scan(
 			&chunk.ChunkID,
-			&chunk.FileID,
+			&chunk.TaskID,
 			&chunk.ChunkIndex,
 			&chunk.ChunkPath,
 			&chunk.ChunkSize,
@@ -186,6 +187,7 @@ func (db *DBManager) GetFile(fileID string) (*FileInfo, error) {
 			&batchID,
 			&uploadTime,
 			&processTime,
+			&batchStartTime,
 			&errorMessage,
 			&batchTaskInfoJSON,
 			&chunk.Retry,
@@ -205,6 +207,9 @@ func (db *DBManager) GetFile(fileID string) (*FileInfo, error) {
 		}
 		if processTime.Valid {
 			chunk.ProcessTime = &processTime.String
+		}
+		if batchStartTime.Valid {
+			chunk.BatchStartTime = &batchStartTime.String
 		}
 		if errorMessage.Valid {
 			chunk.ErrorMessage = &errorMessage.String
@@ -368,16 +373,16 @@ func (db *DBManager) GetChunk(chunkID string) (*FileChunk, error) {
 	defer conn.Close()
 
 	var chunk FileChunk
-	var uploadFileID, batchID, uploadTime, processTime, errorMessage, batchTaskInfoJSON sql.NullString
+	var uploadFileID, batchID, uploadTime, processTime, batchStartTime, errorMessage, batchTaskInfoJSON sql.NullString
 
 	err = conn.QueryRow(`
 		SELECT chunk_id, file_id, chunk_index, chunk_path, chunk_size,
 		       status, upload_file_id, batch_id, upload_time, process_time,
-		       error_message, batch_task_info, retry
+		       batch_start_time, error_message, batch_task_info, retry
 		FROM chunks WHERE chunk_id = ?
 	`, chunkID).Scan(
 		&chunk.ChunkID,
-		&chunk.FileID,
+		&chunk.TaskID,
 		&chunk.ChunkIndex,
 		&chunk.ChunkPath,
 		&chunk.ChunkSize,
@@ -386,6 +391,7 @@ func (db *DBManager) GetChunk(chunkID string) (*FileChunk, error) {
 		&batchID,
 		&uploadTime,
 		&processTime,
+		&batchStartTime,
 		&errorMessage,
 		&batchTaskInfoJSON,
 		&chunk.Retry,
@@ -408,6 +414,9 @@ func (db *DBManager) GetChunk(chunkID string) (*FileChunk, error) {
 	}
 	if processTime.Valid {
 		chunk.ProcessTime = &processTime.String
+	}
+	if batchStartTime.Valid {
+		chunk.BatchStartTime = &batchStartTime.String
 	}
 	if errorMessage.Valid {
 		chunk.ErrorMessage = &errorMessage.String
@@ -443,11 +452,11 @@ func (db *DBManager) AddChunk(chunk *FileChunk) error {
 	_, err = conn.Exec(`
 		INSERT INTO chunks (
 			chunk_id, file_id, chunk_index, chunk_path,
-			chunk_size, status, upload_file_id, batch_id, upload_time, process_time, error_message, batch_task_info, retry
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			chunk_size, status, upload_file_id, batch_id, upload_time, process_time, batch_start_time, error_message, batch_task_info, retry
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
 		chunk.ChunkID,
-		chunk.FileID,
+		chunk.TaskID,
 		chunk.ChunkIndex,
 		chunk.ChunkPath,
 		chunk.ChunkSize,
@@ -456,6 +465,7 @@ func (db *DBManager) AddChunk(chunk *FileChunk) error {
 		chunk.BatchID,
 		chunk.UploadTime,
 		chunk.ProcessTime,
+		chunk.BatchStartTime,
 		chunk.ErrorMessage,
 		batchTaskInfoJSON,
 		chunk.Retry,
@@ -521,9 +531,25 @@ func (db *DBManager) UpdateChunkBatchID(chunkID string, batchID string) error {
 
 	_, err = conn.Exec(`
 		UPDATE chunks 
-		SET batch_id = ?
+		SET batch_id = ?, batch_start_time = ?
 		WHERE chunk_id = ?
-	`, batchID, chunkID)
+	`, batchID, time.Now().Format(time.DateTime), chunkID)
+	return err
+}
+
+// UpdateChunkBatchStartTime 更新文件块batch任务开始时间
+func (db *DBManager) UpdateChunkBatchStartTime(chunkID string, batchStartTime string) error {
+	conn, err := db.getConnection()
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	_, err = conn.Exec(`
+		UPDATE chunks 
+		SET batch_start_time = ?
+		WHERE chunk_id = ?
+	`, batchStartTime, chunkID)
 	return err
 }
 

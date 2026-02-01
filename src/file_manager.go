@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"crypto/md5"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -24,8 +25,8 @@ func NewFileManager(dbManager *DBManager) *FileManager {
 	return &FileManager{dbManager: dbManager}
 }
 
-// generateFileID 生成文件ID
-func (fm *FileManager) generateFileID(filename string) string {
+// generatetaskID 生成文件ID
+func (fm *FileManager) generateTaskID(filename string) string {
 	timestamp := time.Now().Format(time.RFC3339)
 	uniqueID := uuid.New().String()
 	data := fmt.Sprintf("%s_%s_%s", filename, timestamp, uniqueID)
@@ -34,17 +35,17 @@ func (fm *FileManager) generateFileID(filename string) string {
 }
 
 // generateChunkID 生成文件块ID
-func (fm *FileManager) generateChunkID(fileID string, chunkIndex int, retry int) string {
+func (fm *FileManager) generateChunkID(taskID string, chunkIndex int, retry int) string {
 	if retry > 0 {
-		return fmt.Sprintf("%s_retry%d_chunk_%d", fileID, retry, chunkIndex)
+		return fmt.Sprintf("%s_retry%d_chunk_%d", taskID, retry, chunkIndex)
 	}
-	return fmt.Sprintf("%s_chunk_%d", fileID, chunkIndex)
+	return fmt.Sprintf("%s_chunk_%d", taskID, chunkIndex)
 }
 
 // writeChunk 写入文件块
-func (fm *FileManager) writeChunk(fileID string, chunkIndex int, originalFilename string,
+func (fm *FileManager) writeChunk(taskID string, chunkIndex int, originalFilename string,
 	chunkDir string, currentChunkLines []string, fileInfo *FileInfo, retry int) error {
-	chunkID := fm.generateChunkID(fileID, chunkIndex, retry)
+	chunkID := fm.generateChunkID(taskID, chunkIndex, retry)
 
 	var chunkFilename string
 	if retry > 0 {
@@ -65,7 +66,7 @@ func (fm *FileManager) writeChunk(fileID string, chunkIndex int, originalFilenam
 	// 创建文件块信息
 	chunk := &FileChunk{
 		ChunkID:    chunkID,
-		FileID:     fileID,
+		TaskID:     taskID,
 		ChunkIndex: chunkIndex,
 		ChunkPath:  chunkPath,
 		ChunkSize:  len([]byte(chunkData)),
@@ -81,9 +82,75 @@ func (fm *FileManager) writeChunk(fileID string, chunkIndex int, originalFilenam
 	fileInfo.Chunks = append(fileInfo.Chunks, chunk)
 	return nil
 }
+func ValidateMessage(message interface{}) error {
+	//将interface{}类型断言为map[string]interface{}（JSON对象解析后的标准类型）
+	msgMap, ok := message.(map[string]interface{})
+	if !ok {
+		return errors.New("message格式错误：非有效的JSON对象类型")
+	}
+
+	//校验必选字段role - 存在性 + 字符串类型
+	roleVal, hasRole := msgMap["role"]
+	if !hasRole {
+		return errors.New("message格式错误：缺少必选字段role")
+	}
+	if _, ok := roleVal.(string); !ok {
+		return errors.New("message格式错误：role字段必须为字符串类型")
+	}
+
+	//校验content字段 - 存在性 + 字符串/数组类型（JSON数组解析后为[]interface{}）
+	contentVal, hasContent := msgMap["content"]
+	if !hasContent {
+		return errors.New("message格式错误：缺少字段content")
+	}
+	// 判断content是否为字符串 或 数组（[]interface{}）
+	switch contentVal.(type) {
+	case string:
+		// 字符串类型，合法
+	case []interface{}:
+		// 数组类型，合法（JSON数组解析后统一为[]interface{}）
+	default:
+		return errors.New("message格式错误：content字段必须为字符串或数组类型")
+	}
+
+	// 所有校验通过
+	return nil
+}
+
+func CheckFileFormat(file *os.File) error {
+	if file == nil {
+		return fmt.Errorf("file si nil")
+	}
+	scanner := bufio.NewScanner(file)
+	currentLine := 0
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+
+		// 解析JSON
+		var originJSON map[string]interface{}
+		if err := json.Unmarshal([]byte(line), &originJSON); err != nil {
+			return fmt.Errorf("err in line %d: %s", currentLine, err.Error())
+		}
+		messages, ok := originJSON[ModelConf.MessagesKey].([]interface{})
+		if !ok {
+			return fmt.Errorf("err in line %d: %s(%s) is wrong", currentLine, ModelConf.MessagesKey, originJSON[ModelConf.MessagesKey])
+		}
+		for _, message := range messages {
+			if err := ValidateMessage(message); err != nil {
+				return fmt.Errorf("err in line %d, ")
+			}
+		}
+
+	}
+	return nil
+
+}
 
 // SplitFile 分割文件（按行数）
-func (fm *FileManager) SplitFile(filePath string, originalFilename string, linesPerChunk int) (*FileInfo, error) {
+func (fm *FileManager) SplitFile(filePath string, originalFilename string, taskID string, linesPerChunk int) (*FileInfo, error) {
 	file, err := os.Open(filePath)
 	if err != nil {
 		return nil, fmt.Errorf("文件不存在: %s", filePath)
@@ -96,11 +163,9 @@ func (fm *FileManager) SplitFile(filePath string, originalFilename string, lines
 	}
 	fileSize := fileInfo.Size()
 
-	fileID := fm.generateFileID(originalFilename)
-
 	// 创建文件信息
 	fileInfoObj := &FileInfo{
-		FileID:           fileID,
+		TaskID:           taskID,
 		OriginalFilename: originalFilename,
 		FilePath:         filePath,
 		FileSize:         fileSize,
@@ -120,7 +185,7 @@ func (fm *FileManager) SplitFile(filePath string, originalFilename string, lines
 	}
 
 	// 创建文件块目录
-	chunkDir := filepath.Join(CHUNK_DIR, fileID)
+	chunkDir := filepath.Join(CHUNK_DIR, taskID)
 	if err := os.MkdirAll(chunkDir, 0755); err != nil {
 		return nil, err
 	}
@@ -158,6 +223,12 @@ func (fm *FileManager) SplitFile(filePath string, originalFilename string, lines
 		if ModelConf.TopP != nil {
 			body["top_p"] = *ModelConf.TopP
 		}
+		if ModelConf.EnableThinking != nil {
+			body["enable_thinking"] = *ModelConf.EnableThinking
+		}
+		if ModelConf.ExtraBody != nil && len(ModelConf.ExtraBody) > 0 {
+			body["extra_body"] = ModelConf.ExtraBody
+		}
 		newline := map[string]interface{}{
 			"custom_id": fmt.Sprintf("%d", totalLines),
 			"method":    "POST",
@@ -179,9 +250,9 @@ func (fm *FileManager) SplitFile(filePath string, originalFilename string, lines
 
 		// 当达到指定行数时，写入一个块
 		if len(currentChunkLines) >= linesPerChunk {
-			if err := fm.writeChunk(fileID, chunkIndex, originalFilename, chunkDir, currentChunkLines, fileInfoObj, fileInfoObj.Retry); err != nil {
+			if err := fm.writeChunk(taskID, chunkIndex, originalFilename, chunkDir, currentChunkLines, fileInfoObj, fileInfoObj.Retry); err != nil {
 				errorMsg := err.Error()
-				fm.dbManager.UpdateFileStatus(fileID, FileStatusFailed, &errorMsg)
+				fm.dbManager.UpdateFileStatus(taskID, FileStatusFailed, &errorMsg)
 				fileInfoObj.Status = FileStatusFailed
 				fileInfoObj.ErrorMessage = &errorMsg
 				return nil, err
@@ -193,9 +264,9 @@ func (fm *FileManager) SplitFile(filePath string, originalFilename string, lines
 
 	// 处理剩余的行
 	if len(currentChunkLines) > 0 {
-		if err := fm.writeChunk(fileID, chunkIndex, originalFilename, chunkDir, currentChunkLines, fileInfoObj, fileInfoObj.Retry); err != nil {
+		if err := fm.writeChunk(taskID, chunkIndex, originalFilename, chunkDir, currentChunkLines, fileInfoObj, fileInfoObj.Retry); err != nil {
 			errorMsg := err.Error()
-			fm.dbManager.UpdateFileStatus(fileID, FileStatusFailed, &errorMsg)
+			fm.dbManager.UpdateFileStatus(taskID, FileStatusFailed, &errorMsg)
 			fileInfoObj.Status = FileStatusFailed
 			fileInfoObj.ErrorMessage = &errorMsg
 			return nil, err
@@ -208,16 +279,16 @@ func (fm *FileManager) SplitFile(filePath string, originalFilename string, lines
 	fileInfoObj.TotalLines = totalLines
 
 	// 更新状态为分割完成
-	fm.dbManager.UpdateFileStatus(fileID, FileStatusSplitCompleted, nil)
-	fm.dbManager.UpdateFileTotalChunks(fileID, fileInfoObj.TotalChunks)
-	fm.dbManager.UpdateFileTotalLines(fileID, fileInfoObj.TotalLines)
+	fm.dbManager.UpdateFileStatus(taskID, FileStatusSplitCompleted, nil)
+	fm.dbManager.UpdateFileTotalChunks(taskID, fileInfoObj.TotalChunks)
+	fm.dbManager.UpdateFileTotalLines(taskID, fileInfoObj.TotalLines)
 	fileInfoObj.Status = FileStatusSplitCompleted
 
 	return fileInfoObj, nil
 }
 
 // SaveFile 保存文件
-func (fm *FileManager) SaveFile(fileID string, chunkID string, fileContent string, isError bool) error {
+func (fm *FileManager) SaveFile(taskID string, chunkID string, fileContent string, isError bool) error {
 	// 获取chunk信息以确定retry值
 	chunk, err := fm.dbManager.GetChunk(chunkID)
 	if err != nil {
@@ -231,9 +302,9 @@ func (fm *FileManager) SaveFile(fileID string, chunkID string, fileContent strin
 
 	var path string
 	if isError {
-		path = filepath.Join(BATCH_RESULT_DIR, fileID, "error")
+		path = filepath.Join(BATCH_RESULT_DIR, taskID, "error")
 	} else {
-		path = filepath.Join(BATCH_RESULT_DIR, fileID, "output")
+		path = filepath.Join(BATCH_RESULT_DIR, taskID, "output")
 	}
 
 	if err := os.MkdirAll(path, 0755); err != nil {
@@ -245,14 +316,14 @@ func (fm *FileManager) SaveFile(fileID string, chunkID string, fileContent strin
 }
 
 // MergeBatchResults 合并chunk的output和error文件，并找出缺失的记录
-func (fm *FileManager) MergeBatchResults(fileID string, retry int) (map[string]interface{}, error) {
-	fileInfo, err := fm.dbManager.GetFile(fileID)
+func (fm *FileManager) MergeBatchResults(taskID string, retry int) (map[string]interface{}, error) {
+	fileInfo, err := fm.dbManager.GetFile(taskID)
 	if err != nil || fileInfo == nil {
-		return nil, fmt.Errorf("文件不存在: %s", fileID)
+		return nil, fmt.Errorf("文件不存在: %s", taskID)
 	}
 
 	// 创建merged目录
-	mergedDir := filepath.Join(MERGED_DIR, fileID)
+	mergedDir := filepath.Join(MERGED_DIR, taskID)
 	if err := os.MkdirAll(mergedDir, 0755); err != nil {
 		return nil, err
 	}
@@ -321,7 +392,7 @@ func (fm *FileManager) MergeBatchResults(fileID string, retry int) (map[string]i
 		file.Close()
 
 		// 读取output文件（根据retry值选择文件名）
-		outputFile := filepath.Join(BATCH_RESULT_DIR, fileID, "output", fmt.Sprintf("retry%d_%s.jsonl", chunk.Retry, chunk.ChunkID))
+		outputFile := filepath.Join(BATCH_RESULT_DIR, taskID, "output", fmt.Sprintf("retry%d_%s.jsonl", chunk.Retry, chunk.ChunkID))
 		outputCustomIDs := make(map[string]bool)
 
 		if _, err := os.Stat(outputFile); err == nil {
@@ -349,7 +420,7 @@ func (fm *FileManager) MergeBatchResults(fileID string, retry int) (map[string]i
 		}
 
 		// 读取error文件（根据retry值选择文件名）
-		errorFile := filepath.Join(BATCH_RESULT_DIR, fileID, "error", fmt.Sprintf("retry%d_%s.jsonl", chunk.Retry, chunk.ChunkID))
+		errorFile := filepath.Join(BATCH_RESULT_DIR, taskID, "error", fmt.Sprintf("retry%d_%s.jsonl", chunk.Retry, chunk.ChunkID))
 
 		if _, err := os.Stat(errorFile); err == nil {
 			file, err := os.Open(errorFile)
@@ -470,7 +541,7 @@ func (fm *FileManager) MergeBatchResults(fileID string, retry int) (map[string]i
 
 		result["final_output_file"] = finalOutputPath
 
-		fm.dbManager.UpdateFileStatus(fileID, FileStatusProcessCompleted, nil)
+		fm.dbManager.UpdateFileStatus(taskID, FileStatusProcessCompleted, nil)
 		fileInfo.Status = FileStatusProcessCompleted
 	}
 
@@ -480,10 +551,10 @@ func (fm *FileManager) MergeBatchResults(fileID string, retry int) (map[string]i
 }
 
 // RetryFailedRecords 重试失败数据
-func (fm *FileManager) RetryFailedRecords(fileID string) (bool, error) {
-	fileInfo, err := fm.dbManager.GetFile(fileID)
+func (fm *FileManager) RetryFailedRecords(taskID string) (bool, error) {
+	fileInfo, err := fm.dbManager.GetFile(taskID)
 	if err != nil || fileInfo == nil {
-		return false, fmt.Errorf("文件不存在: %s", fileID)
+		return false, fmt.Errorf("文件不存在: %s", taskID)
 	}
 
 	if fileInfo.Status == FileStatusFailed || fileInfo.Status == FileStatusProcessCompleted || fileInfo.Status == FileStatusCanceled {
@@ -491,7 +562,7 @@ func (fm *FileManager) RetryFailedRecords(fileID string) (bool, error) {
 	}
 
 	// 检查missing_records.jsonl是否存在且有数据（根据当前retry值选择文件）
-	missingRecordsPath := filepath.Join(MERGED_DIR, fileID, fmt.Sprintf("missing_records_retry%d.jsonl", fileInfo.Retry))
+	missingRecordsPath := filepath.Join(MERGED_DIR, taskID, fmt.Sprintf("missing_records_retry%d.jsonl", fileInfo.Retry))
 
 	if _, err := os.Stat(missingRecordsPath); os.IsNotExist(err) {
 		return false, fmt.Errorf("缺失记录文件不存在: %s", missingRecordsPath)
@@ -519,13 +590,13 @@ func (fm *FileManager) RetryFailedRecords(fileID string) (bool, error) {
 
 	// 更新重试次数
 	newRetry := fileInfo.Retry + 1
-	if err := fm.dbManager.UpdateFileRetry(fileID, newRetry); err != nil {
+	if err := fm.dbManager.UpdateFileRetry(taskID, newRetry); err != nil {
 		return false, err
 	}
 	fileInfo.Retry = newRetry
 
 	// 创建文件块目录（使用原始目录）
-	chunkDir := filepath.Join(CHUNK_DIR, fileID)
+	chunkDir := filepath.Join(CHUNK_DIR, taskID)
 	if err := os.MkdirAll(chunkDir, 0755); err != nil {
 		return false, err
 	}
@@ -539,7 +610,7 @@ func (fm *FileManager) RetryFailedRecords(fileID string) (bool, error) {
 
 		// 当达到指定行数时，写入一个块
 		if len(currentChunkLines) >= LINES_PER_CHUNK {
-			if err := fm.writeChunk(fileID, chunkIndex, fileInfo.OriginalFilename, chunkDir, currentChunkLines, fileInfo, newRetry); err != nil {
+			if err := fm.writeChunk(taskID, chunkIndex, fileInfo.OriginalFilename, chunkDir, currentChunkLines, fileInfo, newRetry); err != nil {
 				return false, err
 			}
 			chunkIndex++
@@ -549,7 +620,7 @@ func (fm *FileManager) RetryFailedRecords(fileID string) (bool, error) {
 
 	// 处理剩余的行
 	if len(currentChunkLines) > 0 {
-		if err := fm.writeChunk(fileID, chunkIndex, fileInfo.OriginalFilename, chunkDir, currentChunkLines, fileInfo, newRetry); err != nil {
+		if err := fm.writeChunk(taskID, chunkIndex, fileInfo.OriginalFilename, chunkDir, currentChunkLines, fileInfo, newRetry); err != nil {
 			return false, err
 		}
 		chunkIndex++
@@ -557,7 +628,7 @@ func (fm *FileManager) RetryFailedRecords(fileID string) (bool, error) {
 
 	// 更新总块数（累加）
 	fileInfo.TotalChunks += chunkIndex
-	if err := fm.dbManager.UpdateFileTotalChunks(fileID, fileInfo.TotalChunks); err != nil {
+	if err := fm.dbManager.UpdateFileTotalChunks(taskID, fileInfo.TotalChunks); err != nil {
 		return false, err
 	}
 
