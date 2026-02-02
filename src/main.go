@@ -304,6 +304,7 @@ func (bis *BatchInferService) MergeFile(taskID string) (map[string]interface{}, 
 func (bis *BatchInferService) Cancel(taskID string) {
 	fileInfo, err := bis.ValidateFileExists(taskID)
 	if err != nil {
+		logError("取消文件失败: %s", err)
 		return
 	}
 
