@@ -3,12 +3,16 @@
 
 # Model 配置
 model:
-  domain: "xwenlitest2"
+  domain: "test"
   max_tokens: 16384
   messages_key: "messages"
-  password: "bf90d19d203b86f9eedec88bb2b490bf:ZmZiMjg2MTA2N2U3YjE5Mjk4Zjg5Yzc1"
+  password: ""
   temperature: 0.6
-  top_p: 0.95
+  extra_body: {
+    "stop": ["a", "b"],
+    "continue_final_message": true
+  }
+  enable_thinking: false
 
 # 处理配置
 test_lines: -1        # -1 不进行测试，其他数字为测试行数

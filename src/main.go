@@ -944,21 +944,14 @@ func main() {
 	go service.RunDaemon()
 	switch {
 	case pipeline != "":
-		// 完整流程
-		logInfo("进入 pipeline case，参数: %s", pipeline)
 		if taskId == "" {
 			logError("task-id 参数不能为空")
 			os.Exit(1)
 		}
 		service.RunPipeline(pipeline, taskId, nil)
 	case cancel != "":
-		// 终止调度
-		logInfo("进入 cancel case，参数: %s", cancel)
 		service.Cancel(cancel)
 	case monitorProvided:
-		// 监控状态
-		// 如果 monitor 为空字符串，显示所有进行中的文件；否则显示指定文件
-		logInfo("进入 monitor case，参数: %s", monitor)
 		service.MonitorStatus(monitor)
 	default:
 		flag.Usage()
