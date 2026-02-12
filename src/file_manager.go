@@ -191,11 +191,26 @@ func (fm *FileManager) SplitFile(filePath string, originalFilename string, taskI
 	}
 
 	scanner := bufio.NewScanner(file)
+	// 设置更大的缓冲区以支持超长行（默认64KB，设置为10MB）
+	buf := make([]byte, 0, 64*1024)
+	scanner.Buffer(buf, 10*1024*1024) // 最大10MB的缓冲区
+
 	chunkIndex := 0
 	currentChunkLines := []string{}
 	totalLines := 0
+	currentChunkSize := 0                  // 当前chunk的累计大小（字节数）
+	const maxChunkSize = 100 * 1024 * 1024 // 100M = 104857600 字节
 
+	// 检查文件是否为空
+	logInfo("文件大小: %d 字节", fileSize)
+	if fileSize == 0 {
+		logInfo("警告: 文件为空，无法分割")
+		return fileInfoObj, nil
+	}
+
+	lineCount := 0
 	for scanner.Scan() {
+		lineCount++
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" {
 			continue
@@ -204,6 +219,7 @@ func (fm *FileManager) SplitFile(filePath string, originalFilename string, taskI
 		// 解析JSON
 		var originJSON map[string]interface{}
 		if err := json.Unmarshal([]byte(line), &originJSON); err != nil {
+			logInfo("err in line %d: %s", chunkIndex, err.Error())
 			continue
 		}
 
@@ -230,7 +246,7 @@ func (fm *FileManager) SplitFile(filePath string, originalFilename string, taskI
 			body["extra_body"] = ModelConf.ExtraBody
 		}
 		newline := map[string]interface{}{
-			"custom_id": fmt.Sprintf("%d", totalLines),
+			"custom_id": fmt.Sprintf("%d", lineCount),
 			"method":    "POST",
 			"url":       "/v1/chat/completions",
 			"body":      body,
@@ -241,15 +257,14 @@ func (fm *FileManager) SplitFile(filePath string, originalFilename string, taskI
 			continue
 		}
 
-		currentChunkLines = append(currentChunkLines, string(newlineJSON))
-		totalLines++
+		// 计算当前行的字节大小（包括换行符）
+		lineSize := len(newlineJSON) + 1 // +1 是换行符 \n
+		newChunkSize := currentChunkSize + lineSize
+		newChunkLineCount := len(currentChunkLines) + 1
 
-		if TEST_LINES > 0 && totalLines >= TEST_LINES {
-			break
-		}
-
-		// 当达到指定行数时，写入一个块
-		if len(currentChunkLines) >= linesPerChunk {
+		// 如果当前行大小+以前的大小超过100M，或者行数达到限制，将以前的写入文件，本次继续累计
+		// 哪个先到就按那个来
+		if (newChunkSize > maxChunkSize || newChunkLineCount > linesPerChunk) && len(currentChunkLines) > 0 {
 			if err := fm.writeChunk(taskID, chunkIndex, originalFilename, chunkDir, currentChunkLines, fileInfoObj, fileInfoObj.Retry); err != nil {
 				errorMsg := err.Error()
 				fm.dbManager.UpdateFileStatus(taskID, FileStatusFailed, &errorMsg)
@@ -259,8 +274,25 @@ func (fm *FileManager) SplitFile(filePath string, originalFilename string, taskI
 			}
 			chunkIndex++
 			currentChunkLines = []string{}
+			currentChunkSize = 0
+		}
+
+		currentChunkLines = append(currentChunkLines, string(newlineJSON))
+		currentChunkSize += lineSize
+		totalLines++
+
+		if TEST_LINES > 0 && totalLines >= TEST_LINES {
+			break
 		}
 	}
+
+	// 检查是否有读取错误
+	if err := scanner.Err(); err != nil {
+		logError("读取文件时发生错误: %v", err)
+		return nil, fmt.Errorf("读取文件错误: %v", err)
+	}
+
+	logInfo("文件读取完成，共读取 %d 行，有效处理 %d 行", lineCount, totalLines)
 
 	// 处理剩余的行
 	if len(currentChunkLines) > 0 {
