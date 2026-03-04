@@ -45,6 +45,8 @@ max_retry_count: 3           # 失败后的最大重试次数。
 
 ---
 
+## 每个appid最多同时运行200个batch推理，一次性分割文件数量尽量不超过200个，同时每个batch推理最多运行20路，可综合考虑总路数设置合理每个chunk的行数
+
 ## 📋 数据输入规范 (Data Specification)
 
 为确保工具正常解析，您的输入文件（如 `input.jsonl`）必须符合以下标准：
@@ -135,3 +137,6 @@ max_retry_count: 3           # 失败后的最大重试次数。
 **Q6: 参数解析错误 `cannot unmarshal !!str into float64`**
 * **原因**：`config.yaml` 格式错误。
 * **解决**：检查 `temperature` 等数字字段，不要加引号（例如写成 `0.6` 而不是 `"0.6"`）。
+
+**Q7: 分割的行数比配置的行数要少
+* **原因**： chunk文件上传大小有100M限制，确认chunk大小是否接近100M
