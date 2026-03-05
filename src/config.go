@@ -32,8 +32,10 @@ type ModelConfig struct {
 	Password       string                 `yaml:"password"`
 	Temperature    *float64               `yaml:"temperature"`
 	TopP           *float64               `yaml:"top_p"`
-	EnableThinking *bool                  `yaml:"enable_thinking"`
+	EnableThinking *string                `yaml:"enable_thinking"`
 	ExtraBody      map[string]interface{} `yaml:"extra_body"`
+	Tools          []any                  `yaml:"tools"`
+	ToolChoice     any                    `yaml:"tool_choice"`
 }
 
 // Config 配置结构

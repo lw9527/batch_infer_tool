@@ -199,7 +199,7 @@ func (fm *FileManager) SplitFile(filePath string, originalFilename string, taskI
 	currentChunkLines := []string{}
 	totalLines := 0
 	currentChunkSize := 0                  // 当前chunk的累计大小（字节数）
-	const maxChunkSize = 100 * 1024 * 1024 // 100M = 104857600 字节
+	const maxChunkSize = 99 * 1024 * 1024 // 100M = 104857600 字节 需要考虑header大小
 
 	// 检查文件是否为空
 	logInfo("文件大小: %d 字节", fileSize)
@@ -244,6 +244,12 @@ func (fm *FileManager) SplitFile(filePath string, originalFilename string, taskI
 		}
 		if ModelConf.ExtraBody != nil && len(ModelConf.ExtraBody) > 0 {
 			body["extra_body"] = ModelConf.ExtraBody
+		}
+		if ModelConf.Tools != nil && len(ModelConf.Tools) > 0 {
+			body["tools"] = ModelConf.Tools
+		}
+		if ModelConf.ToolChoice != nil {
+			body["tool_choice"] = ModelConf.ToolChoice
 		}
 		newline := map[string]interface{}{
 			"custom_id": fmt.Sprintf("%d", lineCount),
