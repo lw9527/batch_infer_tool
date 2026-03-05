@@ -26,8 +26,8 @@
 
 ```yaml
 model:
-  domain: "test"      # 模型服务标识 (必填)
-  password: "YOUR_PASSWORD"  # 授权密码 (必填)
+  domain: "test"      # 模型服务标识 (必填) 即 modelId
+  password: "YOUR_PASSWORD"  # 授权密码 (必填) APIKey:APISecret, 冒号拼接
   max_tokens: 16384          # 最大输出长度 (必填)
   messages_key: "messages"   # 数据集中的对话字段名
   temperature: 0.6

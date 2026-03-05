@@ -77,8 +77,8 @@ func (bis *BatchInferService) SplitFile(filePath string, taskId string, linesPer
 	return fileInfo.TaskID, nil
 }
 
-// UploadChunks 上传文件块（无并发限制）
-func (bis *BatchInferService) UploadChunks(taskID string) int {
+// UploadChunks 上传文件块（限制上传数量）
+func (bis *BatchInferService) UploadChunks(taskID string, maxCount int) int {
 	fileInfo, err := bis.ValidateFileExists(taskID)
 	if err != nil {
 		return 0
@@ -100,9 +100,12 @@ func (bis *BatchInferService) UploadChunks(taskID string) int {
 		}
 	}
 
-	// 上传所有待上传的chunk（无并发限制）
+	// 限制上传数量，最多上传 maxCount 个chunk
 	uploadedCount := 0
-	for _, chunk := range waitingUploadChunks {
+	for i, chunk := range waitingUploadChunks {
+		if i >= maxCount {
+			break
+		}
 		if _, err := os.Stat(chunk.ChunkPath); err == nil {
 			data, err := os.ReadFile(chunk.ChunkPath)
 			if err == nil {
@@ -230,11 +233,19 @@ func (bis *BatchInferService) UploadAndProcessLoop(taskID string) {
 			}
 		}
 
-		// 无并发限制，直接上传和处理所有可用的chunk
-		if pendingCount+uploadedCount+failedCount > 0 {
-			bis.UploadChunks(taskID)
-			bis.StartChunkProcess(taskID)
+		// 限制同时 processing + uploaded 的数量不超过 200
+		const maxActiveChunks = 200
+		currentActiveCount := processingCount + uploadedCount
+		
+		// 如果还有可用容量，且有待上传的chunk，则上传
+		if currentActiveCount < maxActiveChunks && pendingCount+failedCount > 0 {
+			// 计算还可以上传多少个chunk
+			remainingCapacity := maxActiveChunks - currentActiveCount
+			bis.UploadChunks(taskID, remainingCapacity)
 		}
+		
+		// 直接启动处理任务（无限制，在条件外执行）
+		bis.StartChunkProcess(taskID)
 
 		// 等待一段时间后再次检查
 		time.Sleep(10 * time.Second)

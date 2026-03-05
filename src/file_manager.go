@@ -539,14 +539,23 @@ func (fm *FileManager) MergeBatchResults(taskID string, retry int) (map[string]i
 
 	// 使用文件表中的 max_retry 字段，而不是全局的 MAX_RETRY_COUNT
 	maxRetry := fileInfo.MaxRetry
-	if retry == maxRetry || len(missingRecords) == 0 {
+	// 只有当没有缺失记录，或者达到最大重试次数时，才完成处理
+	// 注意：即使达到最大重试次数，如果还有缺失记录，也应该完成处理（不再重试）
+	shouldComplete := len(missingRecords) == 0 || retry >= maxRetry
+	
+	if shouldComplete {
+		// 如果达到最大重试次数但仍有缺失记录，记录警告
+		if retry >= maxRetry && len(missingRecords) > 0 {
+			logInfo("已达到最大重试次数 (%d)，仍有 %d 条缺失记录，停止重试", maxRetry, len(missingRecords))
+		}
+		
 		// 合并之前所有retry级别的output文件
 		finalOutputPath := filepath.Join(mergedDir, "output.jsonl")
 
 		// 用于存储所有output记录
 		allFinalOutputLines := []string{}
 
-		// 按retry级别从0到maxRetry读取并合并
+		// 按retry级别从0到retry读取并合并
 		for retryLevel := 0; retryLevel <= retry; retryLevel++ {
 			retryOutputPath := filepath.Join(mergedDir, fmt.Sprintf("output_retry%d.jsonl", retryLevel))
 
@@ -596,6 +605,7 @@ func (fm *FileManager) RetryFailedRecords(taskID string) (bool, error) {
 	}
 
 	if fileInfo.Status == FileStatusFailed || fileInfo.Status == FileStatusProcessCompleted || fileInfo.Status == FileStatusCanceled {
+		logInfo("文件状态为 %s，跳过重试", fileInfo.Status)
 		return true, nil
 	}
 
@@ -618,9 +628,17 @@ func (fm *FileManager) RetryFailedRecords(taskID string) (bool, error) {
 			}
 		}
 		file.Close()
+	} else {
+		return false, err
 	}
 
 	if len(missingRecords) == 0 {
+		return true, nil
+	}
+
+	// 检查是否已达到最大重试次数
+	if fileInfo.Retry >= fileInfo.MaxRetry {
+		logInfo("已达到最大重试次数 (%d)，仍有 %d 条缺失记录，停止重试", fileInfo.MaxRetry, len(missingRecords))
 		return true, nil
 	}
 
