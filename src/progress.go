@@ -169,7 +169,7 @@ func (p *ProgressDisplay) CalcProgress(prefix string, finishCount int, totalCoun
 
 	// 组合：prefix + 百分比|进度条|已完成/总数
 	// 使用字符串拼接而不是 fmt.Sprintf，避免格式化问题
-	logInfo("prefix: %d, leftPart: %d, progressBar: %d, rightPart: %d, remainTimePart: %d", prefixWidth, leftWidth, p.GetDisplayWidth(progressBar), rightWidth, remainTimeWidth)
+	// logInfo("prefix: %d, leftPart: %d, progressBar: %d, rightPart: %d, remainTimePart: %d", prefixWidth, leftWidth, p.GetDisplayWidth(progressBar), rightWidth, remainTimeWidth)
 	return prefix + leftPart + progressBar + rightPart + remainTimePart
 }
 

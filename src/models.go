@@ -165,7 +165,7 @@ func (f *FileInfo) GetStatusSummary() *StatusSummary {
 					"complete_count": chunk.BatchTaskInfo.CompletedCount,
 					"failed_count":   chunk.BatchTaskInfo.FailedCount,
 				}
-				logInfo("chunk batch start time:%s", chunk.BatchStartTime)
+				// logInfo("chunk batch start time:%s", chunk.BatchStartTime)
 				// 添加 batch_start_time，转换为 int64 (Unix 时间戳)
 				if chunk.BatchStartTime != nil && *chunk.BatchStartTime != "" {
 					trunkInfo["batch_start_time"] = *chunk.BatchStartTime
