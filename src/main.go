@@ -741,11 +741,16 @@ func (bis *BatchInferService) RunDaemon() {
 		cmd.Stdout = logFileHandle
 		cmd.Stderr = logFileHandle
 	} else {
-		// Unix: 直接启动
+		// Unix: 直接启动，设置进程属性使其独立于父进程
 		cmd = exec.Command(exePath, args...)
 		cmd.Stdout = logFileHandle
 		cmd.Stderr = logFileHandle
-		// 注意：exec.Command 启动的进程本身就是独立的
+		// 设置进程属性，使子进程独立于父进程
+		// Setsid: true 创建新的会话，脱离父进程的进程组
+		// 这样即使父进程被 kill，子进程也不会受到影响
+		cmd.SysProcAttr = &syscall.SysProcAttr{
+			Setsid: true, // 创建新的会话，脱离父进程组
+		}
 	}
 
 	// 启动进程（不等待）
