@@ -748,9 +748,8 @@ func (bis *BatchInferService) RunDaemon() {
 		// 设置进程属性，使子进程独立于父进程
 		// Setsid: true 创建新的会话，脱离父进程的进程组
 		// 这样即使父进程被 kill，子进程也不会受到影响
-		cmd.SysProcAttr = &syscall.SysProcAttr{
-			Setsid: true, // 创建新的会话，脱离父进程组
-		}
+		// 注意：Setsid 只在 Unix 系统上可用，Windows 上不存在此字段
+		setUnixProcessAttr(cmd)
 	}
 
 	// 启动进程（不等待）
