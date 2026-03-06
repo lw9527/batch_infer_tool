@@ -277,7 +277,7 @@ func (bm *BatchManager) CancelBatchTask(batchID string) (map[string]interface{},
 	if err := json.Unmarshal(respBody, &result); err != nil {
 		return nil, err
 	}
-
+	logInfo("取消batch任务结果：%s", string(respBody))
 	return result, nil
 }
 

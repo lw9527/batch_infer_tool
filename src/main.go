@@ -313,35 +313,68 @@ func (bis *BatchInferService) MergeFile(taskID string) (map[string]interface{}, 
 
 // Cancel 终止调度
 func (bis *BatchInferService) Cancel(taskID string) {
-	fileInfo, err := bis.ValidateFileExists(taskID)
-	if err != nil {
-		logError("取消文件失败: %s", err)
-		return
-	}
+	cnt := 0
+	for {
+		// 先不设置文件状态，等所有操作成功后再设置
+		allSuccess := true
+		fileInfo, err := bis.ValidateFileExists(taskID)
+		if err != nil {
+			logError("获取文件失败: %s", err)
+			return
+		}
 
-	// 将file_info的状态设置成canceled
-	bis.dbManager.UpdateFileStatus(taskID, FileStatusCanceled, nil)
-	bis.progress.Update(fmt.Sprintf("文件状态已设置为 CANCELED: %s", taskID))
-
-	// 对processing的chunk调用cancelBatchTask
-	for _, chunk := range fileInfo.Chunks {
-		if chunk.Status == ChunkStatusProcessing && chunk.BatchID != nil {
-			_, err := bis.batchManager.CancelBatchTask(*chunk.BatchID)
-			if err == nil {
-				logInfo("已取消batch任务: %s (chunk: %s)", *chunk.BatchID, chunk.ChunkID)
-			} else {
-				logError("取消batch任务失败 %s: %v", *chunk.BatchID, err)
+		// 对processing的chunk调用cancelBatchTask
+		for _, chunk := range fileInfo.Chunks {
+			if chunk.Status == ChunkStatusProcessing && chunk.BatchID != nil {
+				result, err := bis.batchManager.CancelBatchTask(*chunk.BatchID)
+				if err == nil && result != nil {
+					status, ok := result["status"].(string)
+					if ok && (status == "cancelled" || status == "canceled" || status == "completed") {
+						logInfo("已取消batch任务: %s (chunk: %s)", *chunk.BatchID, chunk.ChunkID)
+						// 取消成功后，将chunk状态设置为CANCELED
+						bis.dbManager.UpdateChunkStatus(chunk.ChunkID, ChunkStatusCanceled, nil)
+						logInfo("已设置chunk状态为CANCELED: %s", chunk.ChunkID)
+					} else {
+						logError("取消batch任务返回状态异常 %s: %v", *chunk.BatchID, result)
+						allSuccess = false
+					}
+				} else {
+					logError("取消batch任务失败 %s: %v", *chunk.BatchID, err)
+					allSuccess = false
+				}
 			}
 		}
-	}
 
-	// uploaded的chunk设置为CANCELED
-	for _, chunk := range fileInfo.Chunks {
-		if chunk.Status == ChunkStatusUploaded {
-			bis.dbManager.UpdateChunkStatus(chunk.ChunkID, ChunkStatusCanceled, nil)
-			logInfo("已设置chunk状态为CANCELED: %s", chunk.ChunkID)
+		// uploaded的chunk设置为CANCELED
+		for _, chunk := range fileInfo.Chunks {
+			if chunk.Status == ChunkStatusUploaded {
+				err := bis.dbManager.UpdateChunkStatus(chunk.ChunkID, ChunkStatusCanceled, nil)
+				if err == nil {
+					logInfo("已设置chunk状态为CANCELED: %s", chunk.ChunkID)
+				} else {
+					logError("设置chunk状态失败 %s: %v", chunk.ChunkID, err)
+					allSuccess = false
+				}
+			}
 		}
+
+		// 只有所有操作都成功，才将文件状态设置为canceled
+		if allSuccess {
+			bis.dbManager.UpdateFileStatus(taskID, FileStatusCanceled, nil)
+			bis.progress.Update(fmt.Sprintf("文件状态已设置为 CANCELED: %s", taskID))
+			break
+		} else {
+			logError("部分操作失败，文件状态未设置为 CANCELED: %s", taskID)
+			time.Sleep(10 * time.Second)
+		}
+		cnt++
+		if cnt > 20 {
+			logInfo("取消文件失败，超过20次，退出")
+			break
+		}
+
 	}
+	
 
 	// 刷新并显示状态
 	fileInfo, _ = bis.dbManager.GetFile(taskID)
