@@ -148,11 +148,6 @@ func (db *DBManager) queryWithRetry(query string, args ...interface{}) (*sql.Row
 
 // initDatabase 初始化数据库
 func (db *DBManager) initDatabase() {
-	conn, err := db.getConnection()
-	if err != nil {
-		logError("初始化数据库失败: %v", err)
-		return
-	}
 
 	// 创建文件信息表（使用重试机制）
 	_, err = db.execWithRetry(`

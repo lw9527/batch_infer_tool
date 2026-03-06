@@ -383,14 +383,18 @@ func (bis *BatchInferService) MonitorSingleFile(taskID string) {
 	fmt.Printf("开始监控文件状态: %s (刷新间隔: 10秒)\n", taskID)
 	fmt.Println("按 Ctrl+C 停止监控\n")
 
-	ticker := time.NewTicker(10 * time.Second)
+	ticker := time.NewTicker(15 * time.Second)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ticker.C:
 			fileInfo, err := bis.dbManager.GetFile(taskID)
-			if err != nil || fileInfo == nil {
+			if err != nil {
+				fmt.Printf("获取文件信息失败: %v, 稍后重试...\n", err)
+				continue
+			}
+			if fileInfo == nil {
 				fmt.Printf("文件不存在: %s\n", taskID)
 				return
 			}
