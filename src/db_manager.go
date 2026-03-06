@@ -148,7 +148,7 @@ func (db *DBManager) queryWithRetry(query string, args ...interface{}) (*sql.Row
 
 // initDatabase 初始化数据库
 func (db *DBManager) initDatabase() {
-
+	var err error
 	// 创建文件信息表（使用重试机制）
 	_, err = db.execWithRetry(`
 		CREATE TABLE IF NOT EXISTS files (
