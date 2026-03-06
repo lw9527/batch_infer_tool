@@ -377,7 +377,7 @@ func (bis *BatchInferService) Cancel(taskID string) {
 	
 
 	// 刷新并显示状态
-	fileInfo, _ = bis.dbManager.GetFile(taskID)
+	fileInfo, _ := bis.dbManager.GetFile(taskID)
 	if fileInfo != nil {
 		bis.progress.ShowStatus(fileInfo, true)
 	}
