@@ -189,7 +189,7 @@ func getRemainTime(execTime *time.Time, completedRadio float64) string {
 	if execTime == nil || completedRadio == 0 {
 		return "        "
 	}
-	logInfo("getRemainTime :%s", execTime.Format(time.DateTime))
+	// logInfo("getRemainTime :%s", execTime.Format(time.DateTime))
 	if completedRadio >= 1 {
 		return "00:00:01"
 	}
