@@ -657,21 +657,31 @@ func (fm *FileManager) RetryFailedRecords(taskID string) (bool, error) {
 		return false, err
 	}
 
-	// 分割缺失记录
+	// 分割缺失记录（同时检查行数和文件大小，限制100M）
 	chunkIndex := 0
 	currentChunkLines := []string{}
+	currentChunkSize := 0                  // 当前chunk的累计大小（字节数）
+	const maxChunkSize = 99 * 1024 * 1024 // 100M = 104857600 字节 需要考虑header大小
 
 	for _, recordLine := range missingRecords {
-		currentChunkLines = append(currentChunkLines, recordLine)
+		// 计算当前行的字节大小（包括换行符）
+		lineSize := len(recordLine) + 1 // +1 是换行符 \n
+		newChunkSize := currentChunkSize + lineSize
+		newChunkLineCount := len(currentChunkLines) + 1
 
-		// 当达到指定行数时，写入一个块
-		if len(currentChunkLines) >= LINES_PER_CHUNK {
+		// 如果当前行大小+以前的大小超过100M，或者行数达到限制，将以前的写入文件，本次继续累计
+		// 哪个先到就按那个来
+		if (newChunkSize > maxChunkSize || newChunkLineCount > LINES_PER_CHUNK) && len(currentChunkLines) > 0 {
 			if err := fm.writeChunk(taskID, chunkIndex, fileInfo.OriginalFilename, chunkDir, currentChunkLines, fileInfo, newRetry); err != nil {
 				return false, err
 			}
 			chunkIndex++
 			currentChunkLines = []string{}
+			currentChunkSize = 0
 		}
+
+		currentChunkLines = append(currentChunkLines, recordLine)
+		currentChunkSize += lineSize
 	}
 
 	// 处理剩余的行
