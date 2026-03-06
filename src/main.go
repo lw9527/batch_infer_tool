@@ -332,7 +332,11 @@ func (bis *BatchInferService) Cancel(taskID string) {
 					if ok && (status == "cancelled" || status == "canceled" || status == "completed") {
 						logInfo("已取消batch任务: %s (chunk: %s)", *chunk.BatchID, chunk.ChunkID)
 						// 取消成功后，将chunk状态设置为CANCELED
-						bis.dbManager.UpdateChunkStatus(chunk.ChunkID, ChunkStatusCanceled, nil)
+						err = bis.dbManager.UpdateChunkStatus(chunk.ChunkID, ChunkStatusCanceled, nil)
+						if err != nil {
+							logError("设置chunk状态失败 %s: %v", chunk.ChunkID, err)
+							allSuccess = false
+						}
 						logInfo("已设置chunk状态为CANCELED: %s", chunk.ChunkID)
 					} else {
 						logError("取消batch任务返回状态异常 %s: %v", *chunk.BatchID, result)
