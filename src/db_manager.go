@@ -3,6 +3,9 @@ package main
 import (
 	"database/sql"
 	"encoding/json"
+	"fmt"
+	"strings"
+	"sync"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -11,6 +14,8 @@ import (
 // DBManager 数据库管理器
 type DBManager struct {
 	dbPath string
+	db     *sql.DB
+	mu     sync.Mutex // 保护数据库连接的互斥锁
 }
 
 // NewDBManager 创建数据库管理器
@@ -20,13 +25,125 @@ func NewDBManager() *DBManager {
 	return db
 }
 
-// getConnection 获取数据库连接
+// getConnection 获取数据库连接（使用连接池）
 func (db *DBManager) getConnection() (*sql.DB, error) {
-	conn, err := sql.Open("sqlite", db.dbPath+"?_timeout=10000")
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
+	if db.db != nil {
+		// 检查连接是否仍然有效
+		if err := db.db.Ping(); err == nil {
+			return db.db, nil
+		}
+		// 连接无效，关闭并重新创建
+		db.db.Close()
+		db.db = nil
+	}
+
+	// 创建新连接，启用 WAL 模式以提高并发性能
+	// _timeout: 超时时间（毫秒），设置为 30 秒
+	// _journal=WAL: 启用 Write-Ahead Logging 模式
+	// _busy_timeout: 当数据库被锁定时等待的时间（毫秒），设置为 30 秒
+	dsn := fmt.Sprintf("%s?_timeout=30000&_journal=WAL&_busy_timeout=30000", db.dbPath)
+	conn, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, err
 	}
-	return conn, nil
+
+	// 设置连接池参数
+	// SQLite 支持多个读连接，但写操作需要串行化
+	conn.SetMaxOpenConns(10)  // 允许最多 10 个并发连接
+	conn.SetMaxIdleConns(5)   // 保持 5 个空闲连接
+	conn.SetConnMaxLifetime(time.Hour) // 连接最大生存时间
+
+	// 启用 WAL 模式
+	_, err = conn.Exec("PRAGMA journal_mode=WAL")
+	if err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("启用 WAL 模式失败: %v", err)
+	}
+
+	// 设置其他优化参数
+	conn.Exec("PRAGMA synchronous=NORMAL") // 平衡性能和安全性
+	conn.Exec("PRAGMA cache_size=-64000")   // 设置缓存大小为 64MB
+
+	db.db = conn
+	return db.db, nil
+}
+
+// isBusyError 检查是否是 SQLITE_BUSY 错误
+func (db *DBManager) isBusyError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := err.Error()
+	return strings.Contains(errStr, "database is locked") ||
+		strings.Contains(errStr, "SQLITE_BUSY") ||
+		strings.Contains(errStr, "database is locked (5)")
+}
+
+// execWithRetry 执行 SQL 语句，带重试机制
+func (db *DBManager) execWithRetry(query string, args ...interface{}) (sql.Result, error) {
+	const maxRetries = 5
+	const retryDelay = 100 * time.Millisecond
+
+	var lastErr error
+	for i := 0; i < maxRetries; i++ {
+		conn, err := db.getConnection()
+		if err != nil {
+			return nil, err
+		}
+
+		result, err := conn.Exec(query, args...)
+		if err == nil {
+			return result, nil
+		}
+
+		lastErr = err
+		if !db.isBusyError(err) {
+			// 不是忙错误，直接返回
+			return nil, err
+		}
+
+		// 是忙错误，等待后重试
+		if i < maxRetries-1 {
+			time.Sleep(retryDelay * time.Duration(i+1)) // 指数退避
+		}
+	}
+
+	return nil, fmt.Errorf("执行 SQL 失败（重试 %d 次后）: %v", maxRetries, lastErr)
+}
+
+// queryWithRetry 执行查询，带重试机制
+func (db *DBManager) queryWithRetry(query string, args ...interface{}) (*sql.Rows, error) {
+	const maxRetries = 5
+	const retryDelay = 100 * time.Millisecond
+
+	var lastErr error
+	for i := 0; i < maxRetries; i++ {
+		conn, err := db.getConnection()
+		if err != nil {
+			return nil, err
+		}
+
+		rows, err := conn.Query(query, args...)
+		if err == nil {
+			return rows, nil
+		}
+
+		lastErr = err
+		if !db.isBusyError(err) {
+			// 不是忙错误，直接返回
+			return nil, err
+		}
+
+		// 是忙错误，等待后重试
+		if i < maxRetries-1 {
+			time.Sleep(retryDelay * time.Duration(i+1)) // 指数退避
+		}
+	}
+
+	return nil, fmt.Errorf("查询 SQL 失败（重试 %d 次后）: %v", maxRetries, lastErr)
 }
 
 // initDatabase 初始化数据库
@@ -36,14 +153,9 @@ func (db *DBManager) initDatabase() {
 		logError("初始化数据库失败: %v", err)
 		return
 	}
-	defer conn.Close()
 
-	// 设置连接池参数
-	conn.SetMaxOpenConns(1)
-	conn.SetMaxIdleConns(1)
-
-	// 创建文件信息表
-	_, err = conn.Exec(`
+	// 创建文件信息表（使用重试机制）
+	_, err = db.execWithRetry(`
 		CREATE TABLE IF NOT EXISTS files (
 			file_id TEXT PRIMARY KEY,
 			original_filename TEXT NOT NULL,
@@ -65,8 +177,8 @@ func (db *DBManager) initDatabase() {
 		return
 	}
 
-	// 创建文件块表
-	_, err = conn.Exec(`
+	// 创建文件块表（使用重试机制）
+	_, err = db.execWithRetry(`
 		CREATE TABLE IF NOT EXISTS chunks (
 			chunk_id TEXT PRIMARY KEY,
 			file_id TEXT NOT NULL,
@@ -93,13 +205,7 @@ func (db *DBManager) initDatabase() {
 
 // CreateFile 创建文件记录
 func (db *DBManager) CreateFile(fileInfo *FileInfo) error {
-	conn, err := db.getConnection()
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-
-	_, err = conn.Exec(`
+	_, err := db.execWithRetry(`
 		INSERT INTO files (
 			file_id, original_filename, file_path, file_size,
 			total_chunks, total_lines, status, created_time, updated_time,
@@ -129,7 +235,6 @@ func (db *DBManager) GetFile(fileID string) (*FileInfo, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer conn.Close()
 
 	var fileInfo FileInfo
 	err = conn.QueryRow(`
@@ -156,11 +261,16 @@ func (db *DBManager) GetFile(fileID string) (*FileInfo, error) {
 		return nil, nil
 	}
 	if err != nil {
+		// 如果是忙错误，重试一次
+		if db.isBusyError(err) {
+			time.Sleep(200 * time.Millisecond)
+			return db.GetFile(fileID)
+		}
 		return nil, err
 	}
 
 	// 获取文件块
-	rows, err := conn.Query(`
+	rows, err := db.queryWithRetry(`
 		SELECT chunk_id, file_id, chunk_index, chunk_path, chunk_size,
 		       status, upload_file_id, batch_id, upload_time, process_time,
 		       batch_start_time, error_message, batch_task_info, retry
@@ -231,13 +341,7 @@ func (db *DBManager) GetFile(fileID string) (*FileInfo, error) {
 
 // GetAllFiles 获取所有文件信息
 func (db *DBManager) GetAllFiles() ([]*FileInfo, error) {
-	conn, err := db.getConnection()
-	if err != nil {
-		return nil, err
-	}
-	defer conn.Close()
-
-	rows, err := conn.Query(`SELECT file_id FROM files ORDER BY created_time DESC`)
+	rows, err := db.queryWithRetry(`SELECT file_id FROM files ORDER BY created_time DESC`)
 	if err != nil {
 		return nil, err
 	}
@@ -268,7 +372,6 @@ func (db *DBManager) GetFileByFilename(filename string) (*FileInfo, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer conn.Close()
 
 	var fileID string
 	err = conn.QueryRow(`
@@ -278,6 +381,11 @@ func (db *DBManager) GetFileByFilename(filename string) (*FileInfo, error) {
 		return nil, nil
 	}
 	if err != nil {
+		// 如果是忙错误，重试一次
+		if db.isBusyError(err) {
+			time.Sleep(200 * time.Millisecond)
+			return db.GetFileByFilename(filename)
+		}
 		return nil, err
 	}
 
@@ -286,13 +394,7 @@ func (db *DBManager) GetFileByFilename(filename string) (*FileInfo, error) {
 
 // UpdateFileStatus 更新文件状态
 func (db *DBManager) UpdateFileStatus(fileID string, status FileStatus, errorMessage *string) error {
-	conn, err := db.getConnection()
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-
-	_, err = conn.Exec(`
+	_, err := db.execWithRetry(`
 		UPDATE files 
 		SET status = ?, updated_time = ?, error_message = ?
 		WHERE file_id = ?
@@ -302,13 +404,7 @@ func (db *DBManager) UpdateFileStatus(fileID string, status FileStatus, errorMes
 
 // UpdateFileMergedPath 更新合并后的文件路径
 func (db *DBManager) UpdateFileMergedPath(fileID string, mergedPath string) error {
-	conn, err := db.getConnection()
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-
-	_, err = conn.Exec(`
+	_, err := db.execWithRetry(`
 		UPDATE files 
 		SET merged_path = ?, updated_time = ?
 		WHERE file_id = ?
@@ -318,13 +414,7 @@ func (db *DBManager) UpdateFileMergedPath(fileID string, mergedPath string) erro
 
 // UpdateFileRetry 更新文件重试次数
 func (db *DBManager) UpdateFileRetry(fileID string, retry int) error {
-	conn, err := db.getConnection()
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-
-	_, err = conn.Exec(`
+	_, err := db.execWithRetry(`
 		UPDATE files 
 		SET retry = ?, updated_time = ?
 		WHERE file_id = ?
@@ -334,13 +424,7 @@ func (db *DBManager) UpdateFileRetry(fileID string, retry int) error {
 
 // UpdateFileTotalChunks 更新文件总块数
 func (db *DBManager) UpdateFileTotalChunks(fileID string, totalChunks int) error {
-	conn, err := db.getConnection()
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-
-	_, err = conn.Exec(`
+	_, err := db.execWithRetry(`
 		UPDATE files 
 		SET total_chunks = ?, updated_time = ?
 		WHERE file_id = ?
@@ -350,13 +434,7 @@ func (db *DBManager) UpdateFileTotalChunks(fileID string, totalChunks int) error
 
 // UpdateFileTotalLines 更新文件总行数
 func (db *DBManager) UpdateFileTotalLines(fileID string, totalLines int) error {
-	conn, err := db.getConnection()
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-
-	_, err = conn.Exec(`
+	_, err := db.execWithRetry(`
 		UPDATE files 
 		SET total_lines = ?, updated_time = ?
 		WHERE file_id = ?
@@ -370,7 +448,6 @@ func (db *DBManager) GetChunk(chunkID string) (*FileChunk, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer conn.Close()
 
 	var chunk FileChunk
 	var uploadFileID, batchID, uploadTime, processTime, batchStartTime, errorMessage, batchTaskInfoJSON sql.NullString
@@ -400,6 +477,11 @@ func (db *DBManager) GetChunk(chunkID string) (*FileChunk, error) {
 		return nil, nil
 	}
 	if err != nil {
+		// 如果是忙错误，重试一次
+		if db.isBusyError(err) {
+			time.Sleep(200 * time.Millisecond)
+			return db.GetChunk(chunkID)
+		}
 		return nil, err
 	}
 
@@ -435,12 +517,6 @@ func (db *DBManager) GetChunk(chunkID string) (*FileChunk, error) {
 
 // AddChunk 添加文件块
 func (db *DBManager) AddChunk(chunk *FileChunk) error {
-	conn, err := db.getConnection()
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-
 	var batchTaskInfoJSON sql.NullString
 	if chunk.BatchTaskInfo != nil {
 		data, err := json.Marshal(chunk.BatchTaskInfo)
@@ -449,7 +525,7 @@ func (db *DBManager) AddChunk(chunk *FileChunk) error {
 		}
 	}
 
-	_, err = conn.Exec(`
+	_, err := db.execWithRetry(`
 		INSERT INTO chunks (
 			chunk_id, file_id, chunk_index, chunk_path,
 			chunk_size, status, upload_file_id, batch_id, upload_time, process_time, batch_start_time, error_message, batch_task_info, retry
@@ -475,45 +551,35 @@ func (db *DBManager) AddChunk(chunk *FileChunk) error {
 
 // UpdateChunkStatus 更新文件块状态
 func (db *DBManager) UpdateChunkStatus(chunkID string, status ChunkStatus, errorMessage *string) error {
-	conn, err := db.getConnection()
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-
 	now := time.Now().Format(time.RFC3339)
 	if status == ChunkStatusUploaded {
-		_, err = conn.Exec(`
+		_, err := db.execWithRetry(`
 			UPDATE chunks 
 			SET status = ?, upload_time = ?, error_message = ?
 			WHERE chunk_id = ?
 		`, string(status), now, errorMessage, chunkID)
+		return err
 	} else if status == ChunkStatusProcessed {
-		_, err = conn.Exec(`
+		_, err := db.execWithRetry(`
 			UPDATE chunks 
 			SET status = ?, process_time = ?, error_message = ?
 			WHERE chunk_id = ?
 		`, string(status), now, errorMessage, chunkID)
+		return err
 	} else {
-		_, err = conn.Exec(`
+		_, err := db.execWithRetry(`
 			UPDATE chunks 
 			SET status = ?, error_message = ?
 			WHERE chunk_id = ?
 		`, string(status), errorMessage, chunkID)
+		return err
 	}
-	return err
 }
 
 // UpdateChunkUploadFileID 更新文件块上传文件id
 func (db *DBManager) UpdateChunkUploadFileID(chunkID string, uploadFileID string) error {
-	conn, err := db.getConnection()
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-
 	now := time.Now().Format(time.RFC3339)
-	_, err = conn.Exec(`
+	_, err := db.execWithRetry(`
 		UPDATE chunks 
 		SET upload_file_id = ?, upload_time = ?
 		WHERE chunk_id = ?
@@ -523,13 +589,7 @@ func (db *DBManager) UpdateChunkUploadFileID(chunkID string, uploadFileID string
 
 // UpdateChunkBatchID 更新文件块batch任务id
 func (db *DBManager) UpdateChunkBatchID(chunkID string, batchID string) error {
-	conn, err := db.getConnection()
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-
-	_, err = conn.Exec(`
+	_, err := db.execWithRetry(`
 		UPDATE chunks 
 		SET batch_id = ?, batch_start_time = ?
 		WHERE chunk_id = ?
@@ -539,13 +599,7 @@ func (db *DBManager) UpdateChunkBatchID(chunkID string, batchID string) error {
 
 // UpdateChunkBatchStartTime 更新文件块batch任务开始时间
 func (db *DBManager) UpdateChunkBatchStartTime(chunkID string, batchStartTime string) error {
-	conn, err := db.getConnection()
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-
-	_, err = conn.Exec(`
+	_, err := db.execWithRetry(`
 		UPDATE chunks 
 		SET batch_start_time = ?
 		WHERE chunk_id = ?
@@ -555,18 +609,12 @@ func (db *DBManager) UpdateChunkBatchStartTime(chunkID string, batchStartTime st
 
 // UpdateChunkBatchTaskInfo 更新文件块batch任务信息
 func (db *DBManager) UpdateChunkBatchTaskInfo(chunkID string, batchTaskInfo *BatchTaskInfo) error {
-	conn, err := db.getConnection()
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-
 	data, err := json.Marshal(batchTaskInfo)
 	if err != nil {
 		return err
 	}
 
-	_, err = conn.Exec(`
+	_, err = db.execWithRetry(`
 		UPDATE chunks 
 		SET batch_task_info = ?
 		WHERE chunk_id = ?
@@ -576,32 +624,20 @@ func (db *DBManager) UpdateChunkBatchTaskInfo(chunkID string, batchTaskInfo *Bat
 
 // DeleteFile 删除文件记录
 func (db *DBManager) DeleteFile(fileID string) error {
-	conn, err := db.getConnection()
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-
 	// 先删除文件块
-	_, err = conn.Exec(`DELETE FROM chunks WHERE file_id = ?`, fileID)
+	_, err := db.execWithRetry(`DELETE FROM chunks WHERE file_id = ?`, fileID)
 	if err != nil {
 		return err
 	}
 
 	// 再删除文件
-	_, err = conn.Exec(`DELETE FROM files WHERE file_id = ?`, fileID)
+	_, err = db.execWithRetry(`DELETE FROM files WHERE file_id = ?`, fileID)
 	return err
 }
 
 // GetPendingFiles 获取需要自动执行的文件列表（状态为split_completed或processing的文件）
 func (db *DBManager) GetPendingFiles() ([]string, error) {
-	conn, err := db.getConnection()
-	if err != nil {
-		return nil, err
-	}
-	defer conn.Close()
-
-	rows, err := conn.Query(`
+	rows, err := db.queryWithRetry(`
 		SELECT file_id 
 		FROM files 
 		WHERE status IN (?, ?)
