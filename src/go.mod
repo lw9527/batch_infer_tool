@@ -1,8 +1,8 @@
 module batch_infer
 
-go 1.24.0
+go 1.23
 
-toolchain go1.24.2
+toolchain go1.23.5
 
 require (
 	github.com/google/uuid v1.5.0

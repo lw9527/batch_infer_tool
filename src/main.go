@@ -236,14 +236,14 @@ func (bis *BatchInferService) UploadAndProcessLoop(taskID string) {
 		// 限制同时 processing + uploaded 的数量不超过 200
 		const maxActiveChunks = 200
 		currentActiveCount := processingCount + uploadedCount
-		
+
 		// 如果还有可用容量，且有待上传的chunk，则上传
 		if currentActiveCount < maxActiveChunks && pendingCount+failedCount > 0 {
 			// 计算还可以上传多少个chunk
 			remainingCapacity := maxActiveChunks - currentActiveCount
 			bis.UploadChunks(taskID, remainingCapacity)
 		}
-		
+
 		// 直接启动处理任务（无限制，在条件外执行）
 		bis.StartChunkProcess(taskID)
 
@@ -378,7 +378,6 @@ func (bis *BatchInferService) Cancel(taskID string) {
 		}
 
 	}
-	
 
 	// 刷新并显示状态
 	fileInfo, _ := bis.dbManager.GetFile(taskID)
@@ -889,6 +888,7 @@ func (bis *BatchInferService) RunDaemonInternal() {
 }
 
 // processPendingFiles 处理所有待处理的文件
+// 不阻塞等待，每个文件在独立goroutine中处理，通过processingFiles map去重
 func (bis *BatchInferService) processPendingFiles() {
 	logInfo("========== 开始扫描待处理文件 ==========")
 
@@ -905,20 +905,20 @@ func (bis *BatchInferService) processPendingFiles() {
 
 	logInfo("找到 %d 个待处理文件", len(taskIDs))
 
-	// 并行处理每个文件
-	var wg sync.WaitGroup
+	// 并行处理每个文件，不等待完成
+	// ProcessFile 内部通过 processingFiles map 保证同一文件不会重复处理
 	for _, taskID := range taskIDs {
-		wg.Add(1)
-		go func(fid string) {
-			defer wg.Done()
-			bis.ProcessFile(fid)
-		}(taskID)
+		bis.processingMutex.Lock()
+		alreadyRunning := bis.processingFiles[taskID]
+		bis.processingMutex.Unlock()
+		if alreadyRunning {
+			logInfo("文件 %s 已在处理中，跳过", taskID)
+			continue
+		}
+		go bis.ProcessFile(taskID)
 	}
 
-	// 等待所有文件处理完成
-	wg.Wait()
-
-	logInfo("========== 本次扫描处理完成 ==========")
+	logInfo("========== 本次扫描完成 ==========")
 }
 
 // DeleteFile 删除文件
