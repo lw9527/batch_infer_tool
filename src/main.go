@@ -193,11 +193,7 @@ func (bis *BatchInferService) UploadAndProcessLoop(taskID string) {
 			break
 		}
 
-		// 检查文件是否被取消，如果被取消则立即退出循环
-		if fileInfo.Status == FileStatusCanceled {
-			logInfo("[%s] 文件已被取消，停止上传和处理", taskID)
-			break
-		}
+		isCanceled := fileInfo.Status == FileStatusCanceled
 
 		// 统计各状态的数量
 		pendingCount := 0
@@ -205,6 +201,7 @@ func (bis *BatchInferService) UploadAndProcessLoop(taskID string) {
 		processingCount := 0
 		processedCount := 0
 		failedCount := 0
+		canceledCount := 0
 
 		for _, chunk := range fileInfo.Chunks {
 			switch chunk.Status {
@@ -218,19 +215,25 @@ func (bis *BatchInferService) UploadAndProcessLoop(taskID string) {
 				processedCount++
 			case ChunkStatusUploadFailed:
 				failedCount++
+			case ChunkStatusCanceled:
+				canceledCount++
 			}
 		}
 
 		// 显示进度
 		bis.progress.ShowStatus(fileInfo, true)
 
-		// 检查是否全部完成
-		if processedCount == totalChunks {
-			bis.progress.Update("✓ 所有文件块处理结束")
+		// 检查是否全部完成（processed + canceled = 总数）
+		if processedCount+canceledCount == totalChunks {
+			if isCanceled {
+				bis.progress.Update(fmt.Sprintf("✓ 所有文件块处理结束（已处理: %d, 已取消: %d）", processedCount, canceledCount))
+			} else {
+				bis.progress.Update("✓ 所有文件块处理结束")
+			}
 			break
 		}
 
-		// 1. 检查正在处理的chunk状态
+		// 1. 检查正在处理的chunk状态（无论是否取消，都要下载已完成的结果）
 		if processingCount > 0 {
 			completedCount := bis.CheckChunkProcess(taskID)
 			if completedCount > 0 {
@@ -624,7 +627,14 @@ func (bis *BatchInferService) ProcessFile(taskID string) {
 		latestInfo, _ := bis.dbManager.GetFile(taskID)
 		isCanceled := latestInfo != nil && (latestInfo.Status == FileStatusCanceled || latestInfo.Status == FileStatusFailed)
 		if isCanceled {
-			logInfo("[%s] 文件已被取消或失败，继续下载结果并合并已处理的数据", taskID)
+			logInfo("[%s] 文件已被取消或失败，开始下载已取消chunk的结果", taskID)
+			// 遍历所有canceled状态的chunk，查询batch实际状态并下载已有结果
+			for _, chunk := range latestInfo.Chunks {
+				if chunk.Status == ChunkStatusCanceled {
+					bis.chunkManager.DownloadCanceledChunkResult(chunk.ChunkID)
+				}
+			}
+			logInfo("[%s] 已取消chunk结果下载完成，继续合并已处理的数据", taskID)
 		}
 		logInfo("[%s] 开始合并文件----------------------------", taskID)
 		_, err := bis.MergeFile(taskID)

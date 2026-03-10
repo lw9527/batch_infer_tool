@@ -87,6 +87,69 @@ func (cm *ChunkManager) ChunkStartProcess(chunkID string) bool {
 	return true
 }
 
+// DownloadCanceledChunkResult 下载已取消chunk的结果（取消的batch任务可能已部分完成，需要下载已有结果）
+func (cm *ChunkManager) DownloadCanceledChunkResult(chunkID string) bool {
+	chunk, err := cm.dbManager.GetChunk(chunkID)
+	if err != nil || chunk == nil {
+		logError("文件块不存在: %s", chunkID)
+		return false
+	}
+
+	if chunk.BatchID == nil {
+		// 没有batch任务，无需下载
+		return true
+	}
+
+	// 查询batch任务的实际状态
+	result, err := cm.batchManager.GetResult(*chunk.BatchID)
+	if err != nil {
+		logError("获取已取消chunk的batch结果失败 %s: %v", chunkID, err)
+		return false
+	}
+
+	if result == nil {
+		logInfo("已取消chunk %s 的batch任务尚无结果", chunkID)
+		return true
+	}
+
+	// 更新batch任务信息
+	if err := cm.dbManager.UpdateChunkBatchTaskInfo(chunkID, result); err != nil {
+		logError("更新batch_task_info失败: %v", err)
+		return false
+	}
+
+	// 下载已有的结果（无论batch是completed/canceled/failed，只要有输出就下载）
+	if result.OutputFileID != "" {
+		content, err := cm.batchManager.GetFileContent(result.OutputFileID)
+		if err == nil {
+			err = cm.fileManager.SaveFile(chunk.TaskID, chunk.ChunkID, content, false)
+			if err != nil {
+				logError("保存结果失败: %v", err)
+				return false
+			}
+			logInfo("已下载取消chunk %s 的输出结果", chunkID)
+		} else {
+			logError("下载取消chunk %s 的输出结果失败: %v", chunkID, err)
+		}
+	}
+
+	if result.ErrorFileID != nil && *result.ErrorFileID != "" {
+		content, err := cm.batchManager.GetFileContent(*result.ErrorFileID)
+		if err == nil {
+			err = cm.fileManager.SaveFile(chunk.TaskID, chunk.ChunkID, content, true)
+			if err != nil {
+				logError("保存错误结果失败: %v", err)
+				return false
+			}
+			logInfo("已下载取消chunk %s 的错误结果", chunkID)
+		} else {
+			logError("下载取消chunk %s 的错误结果失败: %v", chunkID, err)
+		}
+	}
+
+	return true
+}
+
 // CheckChunkProcess 标记文件块为已处理
 func (cm *ChunkManager) CheckChunkProcess(chunkID string) bool {
 	chunk, err := cm.dbManager.GetChunk(chunkID)
@@ -127,22 +190,37 @@ func (cm *ChunkManager) CheckChunkProcess(chunkID string) bool {
 		if result.OutputFileID != "" {
 			content, err := cm.batchManager.GetFileContent(result.OutputFileID)
 			if err == nil {
-				cm.fileManager.SaveFile(chunk.TaskID, chunk.ChunkID, content, false)
+				err = cm.fileManager.SaveFile(chunk.TaskID, chunk.ChunkID, content, false)
+				if err != nil {
+					logError("保存结果失败: %v", err)
+					return false
+				}
+			} else {
+				logError("下载结果失败: %v", err)
+				return false
 			}
 		}
 
 		if result.ErrorFileID != nil && *result.ErrorFileID != "" {
 			content, err := cm.batchManager.GetFileContent(*result.ErrorFileID)
 			if err == nil {
-				cm.fileManager.SaveFile(chunk.TaskID, chunk.ChunkID, content, true)
+				err = cm.fileManager.SaveFile(chunk.TaskID, chunk.ChunkID, content, true)
+				if err != nil {
+					logError("保存结果失败: %v", err)
+					return false
+				}
+			} else {
+				logError("下载结果失败: %v", err)
+				return false
 			}
 		}
-
-		if err := cm.dbManager.UpdateChunkStatus(chunkID, ChunkStatusProcessed, nil); err != nil {
-			logError("更新chunk状态失败: %v", err)
-			return false
+		if chunk.Status == ChunkStatusProcessing {
+			err = cm.dbManager.UpdateChunkStatus(chunkID, ChunkStatusProcessed, nil)
+			if err != nil {
+				logError("更新chunk状态失败: %v", err)
+				return false
+			}
 		}
-
 		return true
 	}
 
