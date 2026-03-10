@@ -798,7 +798,7 @@ func (bis *BatchInferService) removeDaemonLock() {
 
 // RunDaemon 启动常驻进程（使用exec.Command启动独立进程）
 // 多次执行只启动一次，守护进程与主进程完全独立
-func (bis *BatchInferService) RunDaemon() {
+func (bis *BatchInferService) RunDaemon(configPath string) {
 	// 检查守护进程是否已经在运行
 	isRunning := bis.checkDaemonRunning()
 	if isRunning {
@@ -814,8 +814,8 @@ func (bis *BatchInferService) RunDaemon() {
 		return
 	}
 
-	// 构建命令参数（固定间隔60秒）
-	args := []string{"-daemon-internal"}
+	// 构建命令参数（固定间隔60秒），转发配置文件路径给守护进程
+	args := []string{"-daemon-internal", "-config", configPath}
 
 	// 重定向输出到日志文件
 	logFile := filepath.Join(LOG_DIR, "daemon.log")
@@ -1056,7 +1056,7 @@ func main() {
 		service.RunDaemonInternal()
 		return
 	}
-	go service.RunDaemon()
+	go service.RunDaemon(configPath)
 	switch {
 	case pipeline != "":
 		if taskId == "" {
