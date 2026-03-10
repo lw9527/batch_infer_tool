@@ -54,9 +54,6 @@ func (p *ProgressDisplay) Update(message string) {
 	// 因为 message 可能包含 % 字符（如进度条中的百分比）
 	if infoLogger != nil {
 		infoLogger.Print(message)
-		if logFile != nil {
-			logFile.Sync()
-		}
 	}
 }
 
