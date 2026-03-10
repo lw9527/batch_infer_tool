@@ -628,10 +628,26 @@ func (bis *BatchInferService) ProcessFile(taskID string) {
 		isCanceled := latestInfo != nil && (latestInfo.Status == FileStatusCanceled || latestInfo.Status == FileStatusFailed)
 		if isCanceled {
 			logInfo("[%s] 文件已被取消或失败，开始下载已取消chunk的结果", taskID)
-			// 遍历所有canceled状态的chunk，查询batch实际状态并下载已有结果
-			for _, chunk := range latestInfo.Chunks {
-				if chunk.Status == ChunkStatusCanceled {
-					bis.chunkManager.DownloadCanceledChunkResult(chunk.ChunkID)
+			// 遍历所有canceled状态的chunk，查询batch实际状态并下载已有结果，确保全部成功
+			for retry := 0; retry < 20; retry++ {
+				allDownloaded := true
+				for _, chunk := range latestInfo.Chunks {
+					if chunk.Status == ChunkStatusCanceled {
+						if !bis.chunkManager.DownloadCanceledChunkResult(chunk.ChunkID) {
+							logError("[%s] 下载取消chunk结果失败: %s，稍后重试", taskID, chunk.ChunkID)
+							allDownloaded = false
+						}
+					}
+				}
+				if allDownloaded {
+					break
+				}
+				if retry < 19 {
+					logInfo("[%s] 部分取消chunk结果下载失败，10秒后重试 (%d/20)", taskID, retry+1)
+					time.Sleep(10 * time.Second)
+
+				} else {
+					logError("[%s] 取消chunk结果下载重试20次仍有失败，继续合并已有数据", taskID)
 				}
 			}
 			logInfo("[%s] 已取消chunk结果下载完成，继续合并已处理的数据", taskID)
