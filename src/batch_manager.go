@@ -9,12 +9,16 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sync"
+	"time"
 )
 
 // BatchManager 批处理管理器
 type BatchManager struct {
-	password string
-	header   map[string]string
+	password    string
+	header      map[string]string
+	rateMu      sync.Mutex // 限流锁
+	lastReqTime time.Time  // 上次请求时间
 }
 
 // NewBatchManager 创建批处理管理器
@@ -29,8 +33,22 @@ func NewBatchManager() *BatchManager {
 	}
 }
 
+// waitRateLimit 等待以满足 QPS 限制（最多 10 QPS，间隔至少 120ms）
+func (bm *BatchManager) waitRateLimit() {
+	bm.rateMu.Lock()
+	defer bm.rateMu.Unlock()
+
+	const minInterval = 100 * time.Millisecond
+	elapsed := time.Since(bm.lastReqTime)
+	if elapsed < minInterval {
+		time.Sleep(minInterval - elapsed)
+	}
+	bm.lastReqTime = time.Now()
+}
+
 // UploadFile 上传文件获取链接
 func (bm *BatchManager) UploadFile(filePath string) (string, error) {
+	bm.waitRateLimit()
 	url := "https://spark-api-open.xf-yun.com/v1/files"
 
 	file, err := os.Open(filePath)
@@ -98,6 +116,7 @@ func (bm *BatchManager) UploadFile(filePath string) (string, error) {
 
 // GetFiles 获取文件信息
 func (bm *BatchManager) GetFiles(fileID *string) (map[string]interface{}, error) {
+	bm.waitRateLimit()
 	var url string
 	if fileID == nil {
 		url = "https://spark-api-open.xf-yun.com/v1/files"
@@ -136,6 +155,7 @@ func (bm *BatchManager) GetFiles(fileID *string) (map[string]interface{}, error)
 
 // GetFileContent 获取文件内容
 func (bm *BatchManager) GetFileContent(fileID string) (string, error) {
+	bm.waitRateLimit()
 	url := fmt.Sprintf("https://spark-api-open.xf-yun.com/v1/files/%s/content", fileID)
 
 	req, err := http.NewRequest("GET", url, nil)
@@ -164,6 +184,7 @@ func (bm *BatchManager) GetFileContent(fileID string) (string, error) {
 
 // DeleteFile 删除文件
 func (bm *BatchManager) DeleteFile(fileID string) (map[string]interface{}, error) {
+	bm.waitRateLimit()
 	url := fmt.Sprintf("https://spark-api-open.xf-yun.com/v1/files/%s", fileID)
 
 	req, err := http.NewRequest("DELETE", url, nil)
@@ -197,6 +218,7 @@ func (bm *BatchManager) DeleteFile(fileID string) (map[string]interface{}, error
 
 // CreateBatchTask 创建任务并返回taskid
 func (bm *BatchManager) CreateBatchTask(inputFileID string) (string, error) {
+	bm.waitRateLimit()
 	url := "https://spark-api-open.xf-yun.com/v1/batches"
 
 	body := map[string]interface{}{
@@ -250,6 +272,7 @@ func (bm *BatchManager) CreateBatchTask(inputFileID string) (string, error) {
 
 // CancelBatchTask 取消批量任务
 func (bm *BatchManager) CancelBatchTask(batchID string) (map[string]interface{}, error) {
+	bm.waitRateLimit()
 	url := fmt.Sprintf("https://spark-api-open.xf-yun.com/v1/batches/%s/cancel", batchID)
 
 	req, err := http.NewRequest("POST", url, nil)
@@ -283,6 +306,7 @@ func (bm *BatchManager) CancelBatchTask(batchID string) (map[string]interface{},
 
 // QueryBatchTask 查询批量任务状态
 func (bm *BatchManager) QueryBatchTask(batchID string) (map[string]interface{}, error) {
+	bm.waitRateLimit()
 	url := fmt.Sprintf("https://spark-api-open.xf-yun.com/v1/batches/%s", batchID)
 
 	req, err := http.NewRequest("GET", url, nil)
