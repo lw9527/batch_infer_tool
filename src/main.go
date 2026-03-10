@@ -618,24 +618,23 @@ func (bis *BatchInferService) ProcessFile(taskID string) {
 	// 使用文件表中的 max_retry 字段，而不是全局的 MAX_RETRY_COUNT
 	maxRetry := fileInfo.MaxRetry
 	for i := fileInfo.Retry; i <= maxRetry; i++ {
-		// 每轮重试前检查文件是否被取消
-		latestInfo, _ := bis.dbManager.GetFile(taskID)
-		if latestInfo != nil && (latestInfo.Status == FileStatusCanceled || latestInfo.Status == FileStatusFailed) {
-			logInfo("[%s] 文件状态为 %s，停止处理", taskID, latestInfo.Status)
-			break
-		}
 		logInfo("[%s] 开始上传和处理文件块（循环执行）-------------------", taskID)
 		bis.UploadAndProcessLoop(taskID)
-		// UploadAndProcessLoop 退出后再次检查，可能是被 Cancel 中断的
-		latestInfo, _ = bis.dbManager.GetFile(taskID)
-		if latestInfo != nil && (latestInfo.Status == FileStatusCanceled || latestInfo.Status == FileStatusFailed) {
-			logInfo("[%s] 文件已被取消或失败，停止后续合并和重试", taskID)
-			break
+		// UploadAndProcessLoop 退出后检查是否被 Cancel 中断
+		latestInfo, _ := bis.dbManager.GetFile(taskID)
+		isCanceled := latestInfo != nil && (latestInfo.Status == FileStatusCanceled || latestInfo.Status == FileStatusFailed)
+		if isCanceled {
+			logInfo("[%s] 文件已被取消或失败，继续下载结果并合并已处理的数据", taskID)
 		}
 		logInfo("[%s] 开始合并文件----------------------------", taskID)
 		_, err := bis.MergeFile(taskID)
 		if err != nil {
 			logError("[%s] 合并文件失败: %v", taskID, err)
+			break
+		}
+		// 如果是被取消的，合并完成后直接退出，不再重试
+		if isCanceled {
+			logInfo("[%s] 已取消的文件合并完成，退出处理", taskID)
 			break
 		}
 		logInfo("[%s] 检查失败数据---------------------------", taskID)
