@@ -362,12 +362,7 @@ func (fm *FileManager) MergeBatchResults(taskID string, retry int) (map[string]i
 	if err != nil || fileInfo == nil {
 		return nil, fmt.Errorf("文件不存在: %s", taskID)
 	}
-	logInfo("MergeBatchResults fileInfo: TaskID=%s, Status=%s, Retry=%d, MaxRetry=%d, TotalChunks=%d, TotalLines=%d, ChunksCount=%d",
-		fileInfo.TaskID, fileInfo.Status, fileInfo.Retry, fileInfo.MaxRetry, fileInfo.TotalChunks, fileInfo.TotalLines, len(fileInfo.Chunks))
-	for i, chunk := range fileInfo.Chunks {
-		logInfo("  Chunk[%d]: ChunkID=%s, Status=%s, Retry=%d, ChunkPath=%s, BatchID=%v, BatchTaskInfo=%v",
-			i, chunk.ChunkID, chunk.Status, chunk.Retry, chunk.ChunkPath, chunk.BatchID, chunk.BatchTaskInfo)
-	}
+	
 	// 创建merged目录
 	mergedDir := filepath.Join(MERGED_DIR, taskID)
 	if err := os.MkdirAll(mergedDir, 0755); err != nil {
@@ -435,7 +430,6 @@ func (fm *FileManager) MergeBatchResults(taskID string, retry int) (map[string]i
 			customID, _ := record["custom_id"].(string)
 			chunkCustomIDs[customID] = true
 			chunkRecords[customID] = record
-			logInfo("chunkCustomID :%v",customID)
 		}
 		
 		file.Close()
@@ -463,7 +457,6 @@ func (fm *FileManager) MergeBatchResults(taskID string, retry int) (map[string]i
 					}
 
 					customID, _ := outputRecord["custom_id"].(string)
-					logInfo("outputRecord :%v",customID)
 					outputCustomIDs[customID] = true
 					
 					// 构建包含custom_id, request, response的新记录

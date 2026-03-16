@@ -360,6 +360,11 @@ func (bis *BatchInferService) Cancel(taskID string) {
 				if err == nil && result != nil {
 					status, ok := result["status"].(string)
 					if ok && (status == "canceled" || status == "completed") {
+						// 先下载已有的结果，再设置状态为Canceled
+						if !bis.chunkManager.DownloadCanceledChunkResult(chunk.ChunkID) {
+							logError("下载取消chunk结果失败: %s", chunk.ChunkID)
+							allSuccess = false
+						}
 						err = bis.dbManager.UpdateChunkStatus(chunk.ChunkID, ChunkStatusCanceled, nil)
 						if err != nil {
 							logError("设置chunk状态失败 %s: %v", chunk.ChunkID, err)
