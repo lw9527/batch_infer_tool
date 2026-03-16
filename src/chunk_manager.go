@@ -102,7 +102,7 @@ func (cm *ChunkManager) DownloadCanceledChunkResult(chunkID string) bool {
 	}
 
 	// 先判断chunk是否为canceled状态
-	if chunk.Status != ChunkStatusCanceled {
+	if chunk.Status != ChunkStatusCanceled && chunk.Status != ChunkStatusProcessing {
 		logInfo("chunk %s 状态为 %s，非canceled，跳过下载", chunkID, chunk.Status)
 		return true
 	}
