@@ -364,14 +364,16 @@ func (bis *BatchInferService) Cancel(taskID string) {
 						if !bis.chunkManager.DownloadCanceledChunkResult(chunk.ChunkID) {
 							logError("下载取消chunk结果失败: %s", chunk.ChunkID)
 							allSuccess = false
-						}
-						err = bis.dbManager.UpdateChunkStatus(chunk.ChunkID, ChunkStatusCanceled, nil)
-						if err != nil {
-							logError("设置chunk状态失败 %s: %v", chunk.ChunkID, err)
-							allSuccess = false
 						} else {
-							logInfo("已取消batch任务: %s (chunk: %s)", *chunk.BatchID, chunk.ChunkID)
+							err = bis.dbManager.UpdateChunkStatus(chunk.ChunkID, ChunkStatusCanceled, nil)
+							if err != nil {
+								logError("设置chunk状态失败 %s: %v", chunk.ChunkID, err)
+								allSuccess = false
+							} else {
+								logInfo("已取消batch任务: %s (chunk: %s)", *chunk.BatchID, chunk.ChunkID)
+							}
 						}
+						
 					} else {
 						logError("取消batch任务返回状态异常 %s: %v", *chunk.BatchID, result)
 						allSuccess = false
@@ -632,30 +634,30 @@ func (bis *BatchInferService) ProcessFile(taskID string) {
 		latestInfo, _ := bis.dbManager.GetFile(taskID)
 		isCanceled := latestInfo != nil && (latestInfo.Status == FileStatusCanceled || latestInfo.Status == FileStatusFailed)
 		if isCanceled {
-			logInfo("[%s] 文件已被取消或失败，开始下载已取消chunk的结果", taskID)
-			// 遍历所有canceled状态的chunk，查询batch实际状态并下载已有结果，确保全部成功
-			for retry := 0; retry < 20; retry++ {
-				allDownloaded := true
-				for _, chunk := range latestInfo.Chunks {
-					if chunk.Status == ChunkStatusCanceled {
-						if !bis.chunkManager.DownloadCanceledChunkResult(chunk.ChunkID) {
-							logError("[%s] 下载取消chunk结果失败: %s，稍后重试", taskID, chunk.ChunkID)
-							allDownloaded = false
-						}
-					}
-				}
-				if allDownloaded {
-					break
-				}
-				if retry < 19 {
-					logInfo("[%s] 部分取消chunk结果下载失败，10秒后重试 (%d/20)", taskID, retry+1)
-					time.Sleep(10 * time.Second)
+			// logInfo("[%s] 文件已被取消或失败，开始下载已取消chunk的结果", taskID)
+			// // 遍历所有canceled状态的chunk，查询batch实际状态并下载已有结果，确保全部成功
+			// for retry := 0; retry < 20; retry++ {
+			// 	allDownloaded := true
+			// 	for _, chunk := range latestInfo.Chunks {
+			// 		if chunk.Status == ChunkStatusCanceled {
+			// 			if !bis.chunkManager.DownloadCanceledChunkResult(chunk.ChunkID) {
+			// 				logError("[%s] 下载取消chunk结果失败: %s，稍后重试", taskID, chunk.ChunkID)
+			// 				allDownloaded = false
+			// 			}
+			// 		}
+			// 	}
+			// 	if allDownloaded {
+			// 		break
+			// 	}
+			// 	if retry < 19 {
+			// 		logInfo("[%s] 部分取消chunk结果下载失败，10秒后重试 (%d/20)", taskID, retry+1)
+			// 		time.Sleep(10 * time.Second)
 
-				} else {
-					logError("[%s] 取消chunk结果下载重试20次仍有失败，继续合并已有数据", taskID)
-				}
-			}
-			logInfo("[%s] 已取消chunk结果下载完成，继续合并已处理的数据", taskID)
+			// 	} else {
+			// 		logError("[%s] 取消chunk结果下载重试20次仍有失败，继续合并已有数据", taskID)
+			// 	}
+			// }
+			// logInfo("[%s] 已取消chunk结果下载完成，继续合并已处理的数据", taskID)
 		}
 		logInfo("[%s] 开始合并文件----------------------------", taskID)
 		_, err := bis.MergeFile(taskID)
