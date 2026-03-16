@@ -122,6 +122,7 @@ func CheckFileFormat(file *os.File) error {
 		return fmt.Errorf("file si nil")
 	}
 	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 100*1024*1024), 100*1024*1024)
 	currentLine := 0
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
@@ -191,9 +192,9 @@ func (fm *FileManager) SplitFile(filePath string, originalFilename string, taskI
 	}
 
 	scanner := bufio.NewScanner(file)
-	// 设置更大的缓冲区以支持超长行（默认64KB，设置为10MB）
+	// 设置更大的缓冲区以支持超长行（默认64KB，设置为100MB）
 	buf := make([]byte, 0, 64*1024)
-	scanner.Buffer(buf, 10*1024*1024) // 最大10MB的缓冲区
+	scanner.Buffer(buf, 100*1024*1024) // 最大100MB的缓冲区
 
 	chunkIndex := 0
 	currentChunkLines := []string{}
@@ -361,7 +362,12 @@ func (fm *FileManager) MergeBatchResults(taskID string, retry int) (map[string]i
 	if err != nil || fileInfo == nil {
 		return nil, fmt.Errorf("文件不存在: %s", taskID)
 	}
-
+	logInfo("MergeBatchResults fileInfo: TaskID=%s, Status=%s, Retry=%d, MaxRetry=%d, TotalChunks=%d, TotalLines=%d, ChunksCount=%d",
+		fileInfo.TaskID, fileInfo.Status, fileInfo.Retry, fileInfo.MaxRetry, fileInfo.TotalChunks, fileInfo.TotalLines, len(fileInfo.Chunks))
+	for i, chunk := range fileInfo.Chunks {
+		logInfo("  Chunk[%d]: ChunkID=%s, Status=%s, Retry=%d, ChunkPath=%s, BatchID=%v, BatchTaskInfo=%v",
+			i, chunk.ChunkID, chunk.Status, chunk.Retry, chunk.ChunkPath, chunk.BatchID, chunk.BatchTaskInfo)
+	}
 	// 创建merged目录
 	mergedDir := filepath.Join(MERGED_DIR, taskID)
 	if err := os.MkdirAll(mergedDir, 0755); err != nil {
@@ -413,6 +419,7 @@ func (fm *FileManager) MergeBatchResults(taskID string, retry int) (map[string]i
 		}
 
 		scanner := bufio.NewScanner(file)
+		scanner.Buffer(make([]byte, 100*1024*1024), 100*1024*1024)
 		for scanner.Scan() {
 			line := strings.TrimSpace(scanner.Text())
 			if line == "" {
@@ -428,7 +435,9 @@ func (fm *FileManager) MergeBatchResults(taskID string, retry int) (map[string]i
 			customID, _ := record["custom_id"].(string)
 			chunkCustomIDs[customID] = true
 			chunkRecords[customID] = record
+			logInfo("chunkCustomID :%v",customID)
 		}
+		
 		file.Close()
 
 		// 读取output文件（根据retry值选择文件名）
@@ -439,6 +448,8 @@ func (fm *FileManager) MergeBatchResults(taskID string, retry int) (map[string]i
 			file, err := os.Open(outputFile)
 			if err == nil {
 				scanner := bufio.NewScanner(file)
+				// 增大缓冲区大小到1MB，因为单行可能超过默认64KB
+				scanner.Buffer(make([]byte, 100*1024*1024), 100*1024*1024)
 				for scanner.Scan() {
 					line := strings.TrimSpace(scanner.Text())
 					if line == "" {
@@ -452,6 +463,7 @@ func (fm *FileManager) MergeBatchResults(taskID string, retry int) (map[string]i
 					}
 
 					customID, _ := outputRecord["custom_id"].(string)
+					logInfo("outputRecord :%v",customID)
 					outputCustomIDs[customID] = true
 					
 					// 构建包含custom_id, request, response的新记录
@@ -479,6 +491,10 @@ func (fm *FileManager) MergeBatchResults(taskID string, retry int) (map[string]i
 					
 					allOutputLines = append(allOutputLines, string(newRecordJSON))
 				}
+				// 检查scanner是否有错误
+				if err := scanner.Err(); err != nil {
+					logInfo("警告: 读取output文件失败: %v", err)
+				}
 				file.Close()
 			}
 		}
@@ -490,11 +506,15 @@ func (fm *FileManager) MergeBatchResults(taskID string, retry int) (map[string]i
 			file, err := os.Open(errorFile)
 			if err == nil {
 				scanner := bufio.NewScanner(file)
+				scanner.Buffer(make([]byte, 100*1024*1024), 100*1024*1024)
 				for scanner.Scan() {
 					line := strings.TrimSpace(scanner.Text())
 					if line != "" {
 						allErrorLines = append(allErrorLines, line)
 					}
+				}
+				if err := scanner.Err(); err != nil {
+					logInfo("警告: 读取error文件失败: %v", err)
 				}
 				file.Close()
 			}
@@ -589,6 +609,7 @@ func (fm *FileManager) MergeBatchResults(taskID string, retry int) (map[string]i
 				file, err := os.Open(retryOutputPath)
 				if err == nil {
 					scanner := bufio.NewScanner(file)
+					scanner.Buffer(make([]byte, 100*1024*1024), 100*1024*1024)
 					for scanner.Scan() {
 						line := strings.TrimSpace(scanner.Text())
 						if line != "" {
@@ -647,6 +668,7 @@ func (fm *FileManager) RetryFailedRecords(taskID string) (bool, error) {
 	file, err := os.Open(missingRecordsPath)
 	if err == nil {
 		scanner := bufio.NewScanner(file)
+		scanner.Buffer(make([]byte, 100*1024*1024), 100*1024*1024)
 		for scanner.Scan() {
 			line := strings.TrimSpace(scanner.Text())
 			if line != "" {
