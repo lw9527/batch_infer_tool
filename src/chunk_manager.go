@@ -130,7 +130,10 @@ func (cm *ChunkManager) DownloadCanceledChunkResult(chunkID string) bool {
 		logInfo("已取消chunk %s 的batch任务尚无结果", chunkID)
 		return true
 	}
-
+	if result.CompletedCount > 0 && result.OutputFileID == "" {
+		logInfo("CompletedCount %s OutputFileID 为空", result.CompletedCount)
+		return false
+	}
 	// 更新本地batch任务信息
 	if err := cm.dbManager.UpdateChunkBatchTaskInfo(chunkID, result); err != nil {
 		logError("更新batch_task_info失败: %v", err)
