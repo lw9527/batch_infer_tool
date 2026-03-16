@@ -355,6 +355,8 @@ func (fm *FileManager) SaveFile(taskID string, chunkID string, fileContent strin
 
 // MergeBatchResults 合并chunk的output和error文件，并找出缺失的记录
 func (fm *FileManager) MergeBatchResults(taskID string, retry int) (map[string]interface{}, error) {
+	// 强制刷新数据库缓存，确保获取最新数据
+	fm.dbManager.RefreshCache()
 	fileInfo, err := fm.dbManager.GetFile(taskID)
 	if err != nil || fileInfo == nil {
 		return nil, fmt.Errorf("文件不存在: %s", taskID)

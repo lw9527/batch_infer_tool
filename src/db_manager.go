@@ -82,6 +82,17 @@ func (db *DBManager) isBusyError(err error) bool {
 		strings.Contains(errStr, "database is locked (5)")
 }
 
+// RefreshCache 强制刷新数据库缓存，确保后续读取最新数据
+func (db *DBManager) RefreshCache() error {
+	conn, err := db.getConnection()
+	if err != nil {
+		return err
+	}
+	// 执行WAL检查点，将WAL中的数据同步到主数据库
+	_, err = conn.Exec("PRAGMA wal_checkpoint(PASSIVE)")
+	return err
+}
+
 // execWithRetry 执行 SQL 语句，带重试机制
 func (db *DBManager) execWithRetry(query string, args ...interface{}) (sql.Result, error) {
 	const maxRetries = 5
