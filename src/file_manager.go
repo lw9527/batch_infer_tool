@@ -443,15 +443,39 @@ func (fm *FileManager) MergeBatchResults(taskID string, retry int) (map[string]i
 						continue
 					}
 
-					var record map[string]interface{}
-					if err := json.Unmarshal([]byte(line), &record); err != nil {
+					var outputRecord map[string]interface{}
+					if err := json.Unmarshal([]byte(line), &outputRecord); err != nil {
 						logInfo("警告: 解析output记录失败: %v", err)
 						continue
 					}
 
-					customID, _ := record["custom_id"].(string)
+					customID, _ := outputRecord["custom_id"].(string)
 					outputCustomIDs[customID] = true
-					allOutputLines = append(allOutputLines, line)
+					
+					// 构建包含custom_id, request, response的新记录
+					newRecord := map[string]interface{}{
+						"custom_id": customID,
+					}
+					
+					// 从chunkRecords中获取原始请求
+					if requestRecord, ok := chunkRecords[customID]; ok {
+						newRecord["request"] = requestRecord
+					} else {
+						// 如果找不到原始请求，使用空对象
+						newRecord["request"] = map[string]interface{}{}
+					}
+					
+					// 如果output记录有response字段，使用它；否则使用整个output记录		
+					newRecord["response"] = outputRecord
+					
+					// 序列化为JSON字符串
+					newRecordJSON, err := json.Marshal(newRecord)
+					if err != nil {
+						logInfo("警告: 序列化新记录失败: %v", err)
+						continue
+					}
+					
+					allOutputLines = append(allOutputLines, string(newRecordJSON))
 				}
 				file.Close()
 			}
