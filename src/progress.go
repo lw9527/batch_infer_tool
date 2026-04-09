@@ -54,9 +54,6 @@ func (p *ProgressDisplay) Update(message string) {
 	// 因为 message 可能包含 % 字符（如进度条中的百分比）
 	if infoLogger != nil {
 		infoLogger.Print(message)
-		if logFile != nil {
-			logFile.Sync()
-		}
 	}
 }
 
@@ -169,7 +166,7 @@ func (p *ProgressDisplay) CalcProgress(prefix string, finishCount int, totalCoun
 
 	// 组合：prefix + 百分比|进度条|已完成/总数
 	// 使用字符串拼接而不是 fmt.Sprintf，避免格式化问题
-	logInfo("prefix: %d, leftPart: %d, progressBar: %d, rightPart: %d, remainTimePart: %d", prefixWidth, leftWidth, p.GetDisplayWidth(progressBar), rightWidth, remainTimeWidth)
+	// logInfo("prefix: %d, leftPart: %d, progressBar: %d, rightPart: %d, remainTimePart: %d", prefixWidth, leftWidth, p.GetDisplayWidth(progressBar), rightWidth, remainTimeWidth)
 	return prefix + leftPart + progressBar + rightPart + remainTimePart
 }
 
@@ -189,7 +186,7 @@ func getRemainTime(execTime *time.Time, completedRadio float64) string {
 	if execTime == nil || completedRadio == 0 {
 		return "        "
 	}
-	logInfo("getRemainTime :%s", execTime.Format(time.DateTime))
+	// logInfo("getRemainTime :%s", execTime.Format(time.DateTime))
 	if completedRadio >= 1 {
 		return "00:00:01"
 	}

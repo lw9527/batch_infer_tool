@@ -193,12 +193,15 @@ func (bis *BatchInferService) UploadAndProcessLoop(taskID string) {
 			break
 		}
 
+		isCanceled := fileInfo.Status == FileStatusCanceled
+
 		// 统计各状态的数量
 		pendingCount := 0
 		uploadedCount := 0
 		processingCount := 0
 		processedCount := 0
 		failedCount := 0
+		canceledCount := 0
 
 		for _, chunk := range fileInfo.Chunks {
 			switch chunk.Status {
@@ -212,19 +215,25 @@ func (bis *BatchInferService) UploadAndProcessLoop(taskID string) {
 				processedCount++
 			case ChunkStatusUploadFailed:
 				failedCount++
+			case ChunkStatusCanceled:
+				canceledCount++
 			}
 		}
 
 		// 显示进度
 		bis.progress.ShowStatus(fileInfo, true)
 
-		// 检查是否全部完成
-		if processedCount == totalChunks {
-			bis.progress.Update("✓ 所有文件块处理结束")
+		// 检查是否全部完成（processed + canceled = 总数）
+		if processedCount+canceledCount == totalChunks {
+			if isCanceled {
+				bis.progress.Update(fmt.Sprintf("✓ 所有文件块处理结束（已处理: %d, 已取消: %d）", processedCount, canceledCount))
+			} else {
+				bis.progress.Update("✓ 所有文件块处理结束")
+			}
 			break
 		}
 
-		// 1. 检查正在处理的chunk状态
+		// 1. 检查正在处理的chunk状态（无论是否取消，都要下载已完成的结果）
 		if processingCount > 0 {
 			completedCount := bis.CheckChunkProcess(taskID)
 			if completedCount > 0 {
@@ -236,14 +245,14 @@ func (bis *BatchInferService) UploadAndProcessLoop(taskID string) {
 		// 限制同时 processing + uploaded 的数量不超过 200
 		const maxActiveChunks = 200
 		currentActiveCount := processingCount + uploadedCount
-		
+
 		// 如果还有可用容量，且有待上传的chunk，则上传
 		if currentActiveCount < maxActiveChunks && pendingCount+failedCount > 0 {
 			// 计算还可以上传多少个chunk
 			remainingCapacity := maxActiveChunks - currentActiveCount
 			bis.UploadChunks(taskID, remainingCapacity)
 		}
-		
+
 		// 直接启动处理任务（无限制，在条件外执行）
 		bis.StartChunkProcess(taskID)
 
@@ -311,36 +320,95 @@ func (bis *BatchInferService) MergeFile(taskID string) (map[string]interface{}, 
 	return mergedDict, nil
 }
 
-// Cancel 终止调度
+// Cancel 终止调度（幂等：可多次调用，每次都会尝试取消剩余未取消的chunk）
 func (bis *BatchInferService) Cancel(taskID string) {
 	fileInfo, err := bis.ValidateFileExists(taskID)
 	if err != nil {
-		logError("取消文件失败: %s", err)
+		logError("获取文件失败: %s", err)
 		return
 	}
 
-	// 将file_info的状态设置成canceled
-	bis.dbManager.UpdateFileStatus(taskID, FileStatusCanceled, nil)
-	bis.progress.Update(fmt.Sprintf("文件状态已设置为 CANCELED: %s", taskID))
-
-	// 对processing的chunk调用cancelBatchTask
-	for _, chunk := range fileInfo.Chunks {
-		if chunk.Status == ChunkStatusProcessing && chunk.BatchID != nil {
-			_, err := bis.batchManager.CancelBatchTask(*chunk.BatchID)
-			if err == nil {
-				logInfo("已取消batch任务: %s (chunk: %s)", *chunk.BatchID, chunk.ChunkID)
-			} else {
-				logError("取消batch任务失败 %s: %v", *chunk.BatchID, err)
-			}
+	// 第一步：将文件状态设为 canceled，阻止守护进程继续上传和处理
+	// 如果文件已经是 canceled 状态，跳过设置和等待，直接去取消chunk
+	if fileInfo.Status != FileStatusCanceled {
+		err = bis.dbManager.UpdateFileStatus(taskID, FileStatusCanceled, nil)
+		if err != nil {
+			logError("设置文件状态为CANCELED失败 %s: %v", taskID, err)
+			return
 		}
+		logInfo("文件状态已设置为 CANCELED: %s，等待处理循环退出后取消各chunk", taskID)
+		// 等待正在运行的 UploadAndProcessLoop 检测到 canceled 并退出
+		time.Sleep(2 * time.Second)
+	} else {
+		logInfo("文件 %s 已是CANCELED状态，继续取消剩余chunk", taskID)
 	}
 
-	// uploaded的chunk设置为CANCELED
-	for _, chunk := range fileInfo.Chunks {
-		if chunk.Status == ChunkStatusUploaded {
-			bis.dbManager.UpdateChunkStatus(chunk.ChunkID, ChunkStatusCanceled, nil)
-			logInfo("已设置chunk状态为CANCELED: %s", chunk.ChunkID)
+	// 第二步：取消所有非终态的chunk（带重试）
+	cnt := 0
+	for {
+		allSuccess := true
+		fileInfo, err := bis.dbManager.GetFile(taskID)
+		if err != nil || fileInfo == nil {
+			logError("获取文件信息失败: %v", err)
+			break
 		}
+
+		// 对 processing 的chunk调用cancelBatchTask
+		for _, chunk := range fileInfo.Chunks {
+			if chunk.Status == ChunkStatusProcessing && chunk.BatchID != nil {
+				result, err := bis.batchManager.CancelBatchTask(*chunk.BatchID)
+				if err == nil && result != nil {
+					status, ok := result["status"].(string)
+					if ok && (status == "canceled" || status == "completed") {
+						// 先下载已有的结果，再设置状态为Canceled
+						if !bis.chunkManager.DownloadCanceledChunkResult(chunk.ChunkID) {
+							logError("下载取消chunk结果失败: %s", chunk.ChunkID)
+							allSuccess = false
+						} else {
+							err = bis.dbManager.UpdateChunkStatus(chunk.ChunkID, ChunkStatusCanceled, nil)
+							if err != nil {
+								logError("设置chunk状态失败 %s: %v", chunk.ChunkID, err)
+								allSuccess = false
+							} else {
+								logInfo("已取消batch任务: %s (chunk: %s)", *chunk.BatchID, chunk.ChunkID)
+							}
+						}
+						
+					} else {
+						logError("取消batch任务返回状态异常 %s: %v", *chunk.BatchID, result)
+						allSuccess = false
+					}
+				} else {
+					logError("取消batch任务失败 %s: %v", *chunk.BatchID, err)
+					allSuccess = false
+				}
+			}
+		}
+
+		// uploaded、pending、upload_failed 的chunk直接设置为CANCELED
+		for _, chunk := range fileInfo.Chunks {
+			if chunk.Status == ChunkStatusUploaded || chunk.Status == ChunkStatusPending || chunk.Status == ChunkStatusUploadFailed {
+				err := bis.dbManager.UpdateChunkStatus(chunk.ChunkID, ChunkStatusCanceled, nil)
+				if err == nil {
+					logInfo("已设置chunk状态为CANCELED: %s (原状态: %s)", chunk.ChunkID, chunk.Status)
+				} else {
+					logError("设置chunk状态失败 %s: %v", chunk.ChunkID, err)
+					allSuccess = false
+				}
+			}
+		}
+
+		if allSuccess {
+			break
+		}
+
+		cnt++
+		if cnt > 20 {
+			logError("取消chunk操作超过20次仍有失败，退出重试")
+			break
+		}
+		logError("部分chunk取消失败，10秒后重试 (%d/20)", cnt)
+		time.Sleep(10 * time.Second)
 	}
 
 	// 刷新并显示状态
@@ -383,14 +451,18 @@ func (bis *BatchInferService) MonitorSingleFile(taskID string) {
 	fmt.Printf("开始监控文件状态: %s (刷新间隔: 10秒)\n", taskID)
 	fmt.Println("按 Ctrl+C 停止监控\n")
 
-	ticker := time.NewTicker(10 * time.Second)
+	ticker := time.NewTicker(15 * time.Second)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ticker.C:
 			fileInfo, err := bis.dbManager.GetFile(taskID)
-			if err != nil || fileInfo == nil {
+			if err != nil {
+				fmt.Printf("获取文件信息失败: %v, 稍后重试...\n", err)
+				continue
+			}
+			if fileInfo == nil {
 				fmt.Printf("文件不存在: %s\n", taskID)
 				return
 			}
@@ -558,10 +630,44 @@ func (bis *BatchInferService) ProcessFile(taskID string) {
 	for i := fileInfo.Retry; i <= maxRetry; i++ {
 		logInfo("[%s] 开始上传和处理文件块（循环执行）-------------------", taskID)
 		bis.UploadAndProcessLoop(taskID)
+		// UploadAndProcessLoop 退出后检查是否被 Cancel 中断
+		latestInfo, _ := bis.dbManager.GetFile(taskID)
+		isCanceled := latestInfo != nil && (latestInfo.Status == FileStatusCanceled || latestInfo.Status == FileStatusFailed)
+		if isCanceled {
+			// logInfo("[%s] 文件已被取消或失败，开始下载已取消chunk的结果", taskID)
+			// // 遍历所有canceled状态的chunk，查询batch实际状态并下载已有结果，确保全部成功
+			// for retry := 0; retry < 20; retry++ {
+			// 	allDownloaded := true
+			// 	for _, chunk := range latestInfo.Chunks {
+			// 		if chunk.Status == ChunkStatusCanceled {
+			// 			if !bis.chunkManager.DownloadCanceledChunkResult(chunk.ChunkID) {
+			// 				logError("[%s] 下载取消chunk结果失败: %s，稍后重试", taskID, chunk.ChunkID)
+			// 				allDownloaded = false
+			// 			}
+			// 		}
+			// 	}
+			// 	if allDownloaded {
+			// 		break
+			// 	}
+			// 	if retry < 19 {
+			// 		logInfo("[%s] 部分取消chunk结果下载失败，10秒后重试 (%d/20)", taskID, retry+1)
+			// 		time.Sleep(10 * time.Second)
+
+			// 	} else {
+			// 		logError("[%s] 取消chunk结果下载重试20次仍有失败，继续合并已有数据", taskID)
+			// 	}
+			// }
+			// logInfo("[%s] 已取消chunk结果下载完成，继续合并已处理的数据", taskID)
+		}
 		logInfo("[%s] 开始合并文件----------------------------", taskID)
 		_, err := bis.MergeFile(taskID)
 		if err != nil {
 			logError("[%s] 合并文件失败: %v", taskID, err)
+			break
+		}
+		// 如果是被取消的，合并完成后直接退出，不再重试
+		if isCanceled {
+			logInfo("[%s] 已取消的文件合并完成，退出处理", taskID)
 			break
 		}
 		logInfo("[%s] 检查失败数据---------------------------", taskID)
@@ -699,7 +805,7 @@ func (bis *BatchInferService) removeDaemonLock() {
 
 // RunDaemon 启动常驻进程（使用exec.Command启动独立进程）
 // 多次执行只启动一次，守护进程与主进程完全独立
-func (bis *BatchInferService) RunDaemon() {
+func (bis *BatchInferService) RunDaemon(configPath string) {
 	// 检查守护进程是否已经在运行
 	isRunning := bis.checkDaemonRunning()
 	if isRunning {
@@ -715,8 +821,8 @@ func (bis *BatchInferService) RunDaemon() {
 		return
 	}
 
-	// 构建命令参数（固定间隔60秒）
-	args := []string{"-daemon-internal"}
+	// 构建命令参数（固定间隔60秒），转发配置文件路径给守护进程
+	args := []string{"-daemon-internal", "-config", configPath}
 
 	// 重定向输出到日志文件
 	logFile := filepath.Join(LOG_DIR, "daemon.log")
@@ -737,11 +843,15 @@ func (bis *BatchInferService) RunDaemon() {
 		cmd.Stdout = logFileHandle
 		cmd.Stderr = logFileHandle
 	} else {
-		// Unix: 直接启动
+		// Unix: 直接启动，设置进程属性使其独立于父进程
 		cmd = exec.Command(exePath, args...)
 		cmd.Stdout = logFileHandle
 		cmd.Stderr = logFileHandle
-		// 注意：exec.Command 启动的进程本身就是独立的
+		// 设置进程属性，使子进程独立于父进程
+		// Setsid: true 创建新的会话，脱离父进程的进程组
+		// 这样即使父进程被 kill，子进程也不会受到影响
+		// 注意：Setsid 只在 Unix 系统上可用，Windows 上不存在此字段
+		setUnixProcessAttr(cmd)
 	}
 
 	// 启动进程（不等待）
@@ -844,6 +954,7 @@ func (bis *BatchInferService) RunDaemonInternal() {
 }
 
 // processPendingFiles 处理所有待处理的文件
+// 不阻塞等待，每个文件在独立goroutine中处理，通过processingFiles map去重
 func (bis *BatchInferService) processPendingFiles() {
 	logInfo("========== 开始扫描待处理文件 ==========")
 
@@ -860,20 +971,20 @@ func (bis *BatchInferService) processPendingFiles() {
 
 	logInfo("找到 %d 个待处理文件", len(taskIDs))
 
-	// 并行处理每个文件
-	var wg sync.WaitGroup
+	// 并行处理每个文件，不等待完成
+	// ProcessFile 内部通过 processingFiles map 保证同一文件不会重复处理
 	for _, taskID := range taskIDs {
-		wg.Add(1)
-		go func(fid string) {
-			defer wg.Done()
-			bis.ProcessFile(fid)
-		}(taskID)
+		bis.processingMutex.Lock()
+		alreadyRunning := bis.processingFiles[taskID]
+		bis.processingMutex.Unlock()
+		if alreadyRunning {
+			logInfo("文件 %s 已在处理中，跳过", taskID)
+			continue
+		}
+		go bis.ProcessFile(taskID)
 	}
 
-	// 等待所有文件处理完成
-	wg.Wait()
-
-	logInfo("========== 本次扫描处理完成 ==========")
+	logInfo("========== 本次扫描完成 ==========")
 }
 
 // DeleteFile 删除文件
@@ -952,7 +1063,7 @@ func main() {
 		service.RunDaemonInternal()
 		return
 	}
-	go service.RunDaemon()
+	go service.RunDaemon(configPath)
 	switch {
 	case pipeline != "":
 		if taskId == "" {

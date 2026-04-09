@@ -32,7 +32,7 @@ type ModelConfig struct {
 	Password       string                 `yaml:"password"`
 	Temperature    *float64               `yaml:"temperature"`
 	TopP           *float64               `yaml:"top_p"`
-	EnableThinking *bool                `yaml:"enable_thinking"`
+	EnableThinking *bool                  `yaml:"enable_thinking"`
 	ExtraBody      map[string]interface{} `yaml:"extra_body"`
 	Tools          []any                  `yaml:"tools"`
 	ToolChoice     any                    `yaml:"tool_choice"`
@@ -40,10 +40,11 @@ type ModelConfig struct {
 
 // Config 配置结构
 type Config struct {
-	Model         ModelConfig `yaml:"model"`
-	TestLines     *int        `yaml:"test_lines"`      // -1 不进行测试，其他数字为测试行数
-	MaxRetryCount *int        `yaml:"max_retry_count"` // 最大重试次数（默认0，实际值从文件表的max_retry字段读取）
-	LinesPerChunk *int        `yaml:"lines_per_chunk"` // 默认每个分块50000行，不能超过这个值
+	Model            ModelConfig `yaml:"model"`
+	TestLines        *int        `yaml:"test_lines"`           // -1 不进行测试，其他数字为测试行数
+	MaxRetryCount    *int        `yaml:"max_retry_count"`      // 最大重试次数（默认0，实际值从文件表的max_retry字段读取）
+	LinesPerChunk    *int        `yaml:"lines_per_chunk"`      // 默认每个分块50000行，不能超过这个值
+	MaxLogFileSizeMB *int        `yaml:"max_log_file_size_mb"` // 单个日志文件最大大小（单位MB），默认100MB
 }
 
 // model 配置变量（从 YAML 文件加载）
@@ -97,6 +98,13 @@ func LoadConfig(configPath string) error {
 			return fmt.Errorf("配置文件中 lines_per_chunk 不能超过 50000")
 		}
 		LINES_PER_CHUNK = *config.LinesPerChunk
+	}
+	if config.MaxLogFileSizeMB != nil {
+		if *config.MaxLogFileSizeMB <= 0 {
+			return fmt.Errorf("配置文件中 max_log_file_size_mb 必须大于0")
+		}
+		MaxLogFileSize = int64(*config.MaxLogFileSizeMB) * 1024 * 1024
+		logInfo("日志文件大小限制设置为: %dMB", *config.MaxLogFileSizeMB)
 	}
 
 	logInfo("配置文件加载成功: %s", configPath)

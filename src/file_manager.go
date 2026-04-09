@@ -122,6 +122,7 @@ func CheckFileFormat(file *os.File) error {
 		return fmt.Errorf("file si nil")
 	}
 	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 100*1024*1024), 100*1024*1024)
 	currentLine := 0
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
@@ -191,9 +192,9 @@ func (fm *FileManager) SplitFile(filePath string, originalFilename string, taskI
 	}
 
 	scanner := bufio.NewScanner(file)
-	// 设置更大的缓冲区以支持超长行（默认64KB，设置为10MB）
+	// 设置更大的缓冲区以支持超长行（默认64KB，设置为100MB）
 	buf := make([]byte, 0, 64*1024)
-	scanner.Buffer(buf, 10*1024*1024) // 最大10MB的缓冲区
+	scanner.Buffer(buf, 100*1024*1024) // 最大100MB的缓冲区
 
 	chunkIndex := 0
 	currentChunkLines := []string{}
@@ -355,11 +356,13 @@ func (fm *FileManager) SaveFile(taskID string, chunkID string, fileContent strin
 
 // MergeBatchResults 合并chunk的output和error文件，并找出缺失的记录
 func (fm *FileManager) MergeBatchResults(taskID string, retry int) (map[string]interface{}, error) {
+	// 强制刷新数据库缓存，确保获取最新数据
+	fm.dbManager.RefreshCache()
 	fileInfo, err := fm.dbManager.GetFile(taskID)
 	if err != nil || fileInfo == nil {
 		return nil, fmt.Errorf("文件不存在: %s", taskID)
 	}
-
+	
 	// 创建merged目录
 	mergedDir := filepath.Join(MERGED_DIR, taskID)
 	if err := os.MkdirAll(mergedDir, 0755); err != nil {
@@ -411,6 +414,7 @@ func (fm *FileManager) MergeBatchResults(taskID string, retry int) (map[string]i
 		}
 
 		scanner := bufio.NewScanner(file)
+		scanner.Buffer(make([]byte, 100*1024*1024), 100*1024*1024)
 		for scanner.Scan() {
 			line := strings.TrimSpace(scanner.Text())
 			if line == "" {
@@ -427,6 +431,7 @@ func (fm *FileManager) MergeBatchResults(taskID string, retry int) (map[string]i
 			chunkCustomIDs[customID] = true
 			chunkRecords[customID] = record
 		}
+		
 		file.Close()
 
 		// 读取output文件（根据retry值选择文件名）
@@ -437,21 +442,51 @@ func (fm *FileManager) MergeBatchResults(taskID string, retry int) (map[string]i
 			file, err := os.Open(outputFile)
 			if err == nil {
 				scanner := bufio.NewScanner(file)
+				// 增大缓冲区大小到1MB，因为单行可能超过默认64KB
+				scanner.Buffer(make([]byte, 100*1024*1024), 100*1024*1024)
 				for scanner.Scan() {
 					line := strings.TrimSpace(scanner.Text())
 					if line == "" {
 						continue
 					}
 
-					var record map[string]interface{}
-					if err := json.Unmarshal([]byte(line), &record); err != nil {
+					var outputRecord map[string]interface{}
+					if err := json.Unmarshal([]byte(line), &outputRecord); err != nil {
 						logInfo("警告: 解析output记录失败: %v", err)
 						continue
 					}
 
-					customID, _ := record["custom_id"].(string)
+					customID, _ := outputRecord["custom_id"].(string)
 					outputCustomIDs[customID] = true
-					allOutputLines = append(allOutputLines, line)
+					
+					// 构建包含custom_id, request, response的新记录
+					newRecord := map[string]interface{}{
+						"custom_id": customID,
+					}
+					
+					// 从chunkRecords中获取原始请求
+					if requestRecord, ok := chunkRecords[customID]; ok {
+						newRecord["request"] = requestRecord
+					} else {
+						// 如果找不到原始请求，使用空对象
+						newRecord["request"] = map[string]interface{}{}
+					}
+					
+					// 如果output记录有response字段，使用它；否则使用整个output记录		
+					newRecord["response"] = outputRecord
+					
+					// 序列化为JSON字符串
+					newRecordJSON, err := json.Marshal(newRecord)
+					if err != nil {
+						logInfo("警告: 序列化新记录失败: %v", err)
+						continue
+					}
+					
+					allOutputLines = append(allOutputLines, string(newRecordJSON))
+				}
+				// 检查scanner是否有错误
+				if err := scanner.Err(); err != nil {
+					logInfo("警告: 读取output文件失败: %v", err)
 				}
 				file.Close()
 			}
@@ -464,11 +499,15 @@ func (fm *FileManager) MergeBatchResults(taskID string, retry int) (map[string]i
 			file, err := os.Open(errorFile)
 			if err == nil {
 				scanner := bufio.NewScanner(file)
+				scanner.Buffer(make([]byte, 100*1024*1024), 100*1024*1024)
 				for scanner.Scan() {
 					line := strings.TrimSpace(scanner.Text())
 					if line != "" {
 						allErrorLines = append(allErrorLines, line)
 					}
+				}
+				if err := scanner.Err(); err != nil {
+					logInfo("警告: 读取error文件失败: %v", err)
 				}
 				file.Close()
 			}
@@ -563,6 +602,7 @@ func (fm *FileManager) MergeBatchResults(taskID string, retry int) (map[string]i
 				file, err := os.Open(retryOutputPath)
 				if err == nil {
 					scanner := bufio.NewScanner(file)
+					scanner.Buffer(make([]byte, 100*1024*1024), 100*1024*1024)
 					for scanner.Scan() {
 						line := strings.TrimSpace(scanner.Text())
 						if line != "" {
@@ -621,6 +661,7 @@ func (fm *FileManager) RetryFailedRecords(taskID string) (bool, error) {
 	file, err := os.Open(missingRecordsPath)
 	if err == nil {
 		scanner := bufio.NewScanner(file)
+		scanner.Buffer(make([]byte, 100*1024*1024), 100*1024*1024)
 		for scanner.Scan() {
 			line := strings.TrimSpace(scanner.Text())
 			if line != "" {
@@ -657,21 +698,31 @@ func (fm *FileManager) RetryFailedRecords(taskID string) (bool, error) {
 		return false, err
 	}
 
-	// 分割缺失记录
+	// 分割缺失记录（同时检查行数和文件大小，限制100M）
 	chunkIndex := 0
 	currentChunkLines := []string{}
+	currentChunkSize := 0                  // 当前chunk的累计大小（字节数）
+	const maxChunkSize = 99 * 1024 * 1024 // 100M = 104857600 字节 需要考虑header大小
 
 	for _, recordLine := range missingRecords {
-		currentChunkLines = append(currentChunkLines, recordLine)
+		// 计算当前行的字节大小（包括换行符）
+		lineSize := len(recordLine) + 1 // +1 是换行符 \n
+		newChunkSize := currentChunkSize + lineSize
+		newChunkLineCount := len(currentChunkLines) + 1
 
-		// 当达到指定行数时，写入一个块
-		if len(currentChunkLines) >= LINES_PER_CHUNK {
+		// 如果当前行大小+以前的大小超过100M，或者行数达到限制，将以前的写入文件，本次继续累计
+		// 哪个先到就按那个来
+		if (newChunkSize > maxChunkSize || newChunkLineCount > LINES_PER_CHUNK) && len(currentChunkLines) > 0 {
 			if err := fm.writeChunk(taskID, chunkIndex, fileInfo.OriginalFilename, chunkDir, currentChunkLines, fileInfo, newRetry); err != nil {
 				return false, err
 			}
 			chunkIndex++
 			currentChunkLines = []string{}
+			currentChunkSize = 0
 		}
+
+		currentChunkLines = append(currentChunkLines, recordLine)
+		currentChunkSize += lineSize
 	}
 
 	// 处理剩余的行

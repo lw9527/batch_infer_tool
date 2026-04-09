@@ -31,21 +31,17 @@ model:
   max_tokens: 16384          # 最大输出长度 (必填)
   messages_key: "messages"   # 数据集中的对话字段名
   temperature: 0.6
-  enable_thinking: false
-  extra_body: {
-    "stop":[],
-    "continue_final_message":false
-  }
 
 # 处理策略
-test_lines: 300              # 【重要】测试行数限制。若设为 300，则仅处理输入文件的前 300 行，剩余数据将被忽略。正式生产环境请设为 0 以处理全量数据。
-lines_per_chunk: 200         # 每个分块包含的数据行数。
+test_lines: 300              # 【重要】测试行数限制。若设为 300，则仅处理输入文件的前 300 行，剩余数据将被忽略。正式生产环境请设为 -1 以处理全量数据。
+lines_per_chunk: 1         # 每个分块包含的数据行数。
 max_retry_count: 3           # 失败后的最大重试次数。
+max_log_file_size_mb: 1     # 日志文件大小,不设置默认100M
 ```
 
 ---
 
-## 每个appid最多同时运行200个batch推理，一次性分割文件数量尽量不超过200个，同时每个batch推理最多运行20路，可综合考虑总路数设置合理每个chunk的行数
+## 每个appid最多同时运行200个batch推理，超过200个将在本地排队，同时每个batch推理最多运行20路，可综合考虑总路数设置合理每个chunk的行数。 如果使用总路数超过4000路，建议分多个appid提交
 
 ## 📋 数据输入规范 (Data Specification)
 
