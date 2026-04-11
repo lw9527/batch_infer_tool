@@ -119,7 +119,7 @@ func (cm *ChunkManager) DownloadCanceledChunkResult(chunkID string) bool {
 	// 	result = chunk.BatchTaskInfo
 	// 	logInfo("chunk %s 的BatchTaskInfo已为canceled，使用本地缓存", chunkID)
 	// } else {
-		// BatchTaskInfo不存在或状态不是canceled，需要查询远端获取最新状态
+	// BatchTaskInfo不存在或状态不是canceled，需要查询远端获取最新状态
 	result, err = cm.batchManager.GetResult(*chunk.BatchID)
 	if err != nil {
 		logError("获取已取消chunk的batch结果失败 %s: %v", chunkID, err)
@@ -131,7 +131,7 @@ func (cm *ChunkManager) DownloadCanceledChunkResult(chunkID string) bool {
 		return true
 	}
 	if result.CompletedCount > 0 && result.OutputFileID == "" {
-		logInfo("CompletedCount %s OutputFileID 为空", result.CompletedCount)
+		logInfo("CompletedCount %d OutputFileID 为空", result.CompletedCount)
 		return false
 	}
 	// 更新本地batch任务信息
@@ -145,7 +145,7 @@ func (cm *ChunkManager) DownloadCanceledChunkResult(chunkID string) bool {
 	// 先检查本地文件是否已存在，避免重复下载
 	outputPath := filepath.Join(BATCH_RESULT_DIR, chunk.TaskID, "output", fmt.Sprintf("retry%d_%s.jsonl", chunk.Retry, chunk.ChunkID))
 	errorPath := filepath.Join(BATCH_RESULT_DIR, chunk.TaskID, "error", fmt.Sprintf("retry%d_%s.jsonl", chunk.Retry, chunk.ChunkID))
-	
+
 	if result.OutputFileID != "" {
 		if _, statErr := os.Stat(outputPath); statErr == nil {
 			logInfo("chunk %s 的输出结果文件已存在，跳过下载", chunkID)
@@ -159,7 +159,7 @@ func (cm *ChunkManager) DownloadCanceledChunkResult(chunkID string) bool {
 				} else {
 					logInfo("已下载取消chunk %s 的输出结果", chunkID)
 				}
-				
+
 			} else {
 				logError("下载取消chunk %s 的输出结果失败: %v", chunkID, err)
 				return false
