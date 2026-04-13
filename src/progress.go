@@ -203,6 +203,22 @@ func getRemainTime(execTime *time.Time, completedRadio float64) string {
 func (p *ProgressDisplay) ShowStatus(fileInfo *FileInfo, clearScreen bool) {
 	summary := fileInfo.GetStatusSummary()
 	total := summary.Total
+	if total["pending"] == summary.TotalChunks && summary.TotalChunks > 0 {
+		serviceID := fileInfo.Model.ServiceID
+		if serviceID == "" {
+			serviceID = fileInfo.Model.Domain
+		}
+		deployValue, usedValue, totalValue := getServiceInfo(serviceID)
+		if totalValue <= 0 {
+			statusMsg := fmt.Sprintf("\n 文件: %s | task_id: %s \n 引擎%s未就绪，monitor=%d, pipeline=%d/%d，等待服务启动...",
+				fileInfo.OriginalFilename, fileInfo.TaskID, serviceID, deployValue, usedValue, totalValue)
+			if clearScreen {
+				clearScreenFunc()
+			}
+			p.Update(statusMsg)
+			return
+		}
+	}
 
 	statusMsg := fmt.Sprintf("\n 文件: %s | task_id: %s \n 总块数: %d | 待上传：%d | 已上传: %d | 处理中: %d | 已处理: %d | 上传失败: %d \n 总处理行数: %d | 已完成行数: %d | 失败行数: %d | 重试次数: %d次",
 		fileInfo.OriginalFilename, fileInfo.TaskID, summary.TotalChunks,
