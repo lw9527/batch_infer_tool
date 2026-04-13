@@ -186,10 +186,12 @@ func (bis *BatchInferService) UploadAndProcessLoop(taskID string) {
 
 	totalChunks := len(fileInfo.Chunks)
 	for {
-		_,_, totalValue := getServiceInfo(fileInfo.Model.Domain)
-		if	totalValue > 0 {
+		_, _, totalValue := getServiceInfo(fileInfo.Model.Domain)
+		if totalValue > 0 {
+			bis.progress.Update(fmt.Sprintf("引擎%s已启动，开始处理任务", fileInfo.Model.Domain))
 			break
 		}
+		bis.progress.Update(fmt.Sprintf("引擎%s未启动，等待1分钟后重试", fileInfo.Model.Domain))
 		logInfo("引擎%s未启动，等待1分钟", fileInfo.Model.Domain)
 		time.Sleep(60 * time.Second)
 	}
