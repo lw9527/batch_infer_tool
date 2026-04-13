@@ -13,24 +13,20 @@ import (
 	"time"
 )
 
-// BatchManager 批处理管理器
+// BatchManager 批处理管理器（鉴权按任务 FileInfo.Model 传入，不再依赖进程内全局 ModelConf）
 type BatchManager struct {
-	password    string
-	header      map[string]string
 	rateMu      sync.Mutex // 限流锁
 	lastReqTime time.Time  // 上次请求时间
 }
 
 // NewBatchManager 创建批处理管理器
 func NewBatchManager() *BatchManager {
-	header := make(map[string]string)
-	header["Authorization"] = "Bearer " + ModelConf.Password
-	header["Content-Type"] = "application/json"
+	return &BatchManager{}
+}
 
-	return &BatchManager{
-		password: ModelConf.Password,
-		header:   header,
-	}
+func (bm *BatchManager) setJSONAuth(req *http.Request, mc ModelConfig) {
+	req.Header.Set("Authorization", "Bearer "+mc.Password)
+	req.Header.Set("Content-Type", "application/json")
 }
 
 // waitRateLimit 等待以满足 QPS 限制（最多 10 QPS，间隔至少 120ms）
@@ -47,7 +43,7 @@ func (bm *BatchManager) waitRateLimit() {
 }
 
 // UploadFile 上传文件获取链接
-func (bm *BatchManager) UploadFile(filePath string) (string, error) {
+func (bm *BatchManager) UploadFile(filePath string, mc ModelConfig) (string, error) {
 	bm.waitRateLimit()
 	url := "https://spark-api-open.xf-yun.com/v1/files"
 
@@ -84,7 +80,7 @@ func (bm *BatchManager) UploadFile(filePath string) (string, error) {
 		return "", err
 	}
 
-	req.Header.Set("Authorization", "Bearer "+bm.password)
+	req.Header.Set("Authorization", "Bearer "+mc.Password)
 	req.Header.Set("Content-Type", writer.FormDataContentType())
 
 	client := &http.Client{}
@@ -115,7 +111,7 @@ func (bm *BatchManager) UploadFile(filePath string) (string, error) {
 }
 
 // GetFiles 获取文件信息
-func (bm *BatchManager) GetFiles(fileID *string) (map[string]interface{}, error) {
+func (bm *BatchManager) GetFiles(fileID *string, mc ModelConfig) (map[string]interface{}, error) {
 	bm.waitRateLimit()
 	var url string
 	if fileID == nil {
@@ -129,9 +125,7 @@ func (bm *BatchManager) GetFiles(fileID *string) (map[string]interface{}, error)
 		return nil, err
 	}
 
-	for k, v := range bm.header {
-		req.Header.Set(k, v)
-	}
+	bm.setJSONAuth(req, mc)
 
 	client := &http.Client{}
 	resp, err := client.Do(req)
@@ -154,7 +148,7 @@ func (bm *BatchManager) GetFiles(fileID *string) (map[string]interface{}, error)
 }
 
 // GetFileContent 获取文件内容
-func (bm *BatchManager) GetFileContent(fileID string) (string, error) {
+func (bm *BatchManager) GetFileContent(fileID string, mc ModelConfig) (string, error) {
 	bm.waitRateLimit()
 	url := fmt.Sprintf("https://spark-api-open.xf-yun.com/v1/files/%s/content", fileID)
 
@@ -163,9 +157,7 @@ func (bm *BatchManager) GetFileContent(fileID string) (string, error) {
 		return "", err
 	}
 
-	for k, v := range bm.header {
-		req.Header.Set(k, v)
-	}
+	bm.setJSONAuth(req, mc)
 
 	client := &http.Client{}
 	resp, err := client.Do(req)
@@ -183,7 +175,7 @@ func (bm *BatchManager) GetFileContent(fileID string) (string, error) {
 }
 
 // DeleteFile 删除文件
-func (bm *BatchManager) DeleteFile(fileID string) (map[string]interface{}, error) {
+func (bm *BatchManager) DeleteFile(fileID string, mc ModelConfig) (map[string]interface{}, error) {
 	bm.waitRateLimit()
 	url := fmt.Sprintf("https://spark-api-open.xf-yun.com/v1/files/%s", fileID)
 
@@ -192,9 +184,7 @@ func (bm *BatchManager) DeleteFile(fileID string) (map[string]interface{}, error
 		return nil, err
 	}
 
-	for k, v := range bm.header {
-		req.Header.Set(k, v)
-	}
+	bm.setJSONAuth(req, mc)
 
 	client := &http.Client{}
 	resp, err := client.Do(req)
@@ -217,7 +207,7 @@ func (bm *BatchManager) DeleteFile(fileID string) (map[string]interface{}, error
 }
 
 // CreateBatchTask 创建任务并返回taskid
-func (bm *BatchManager) CreateBatchTask(inputFileID string) (string, error) {
+func (bm *BatchManager) CreateBatchTask(inputFileID string, mc ModelConfig) (string, error) {
 	bm.waitRateLimit()
 	url := "https://spark-api-open.xf-yun.com/v1/batches"
 
@@ -239,9 +229,7 @@ func (bm *BatchManager) CreateBatchTask(inputFileID string) (string, error) {
 		return "", err
 	}
 
-	for k, v := range bm.header {
-		req.Header.Set(k, v)
-	}
+	bm.setJSONAuth(req, mc)
 
 	client := &http.Client{}
 	resp, err := client.Do(req)
@@ -271,7 +259,7 @@ func (bm *BatchManager) CreateBatchTask(inputFileID string) (string, error) {
 }
 
 // CancelBatchTask 取消批量任务
-func (bm *BatchManager) CancelBatchTask(batchID string) (map[string]interface{}, error) {
+func (bm *BatchManager) CancelBatchTask(batchID string, mc ModelConfig) (map[string]interface{}, error) {
 	bm.waitRateLimit()
 	url := fmt.Sprintf("https://spark-api-open.xf-yun.com/v1/batches/%s/cancel", batchID)
 
@@ -280,9 +268,7 @@ func (bm *BatchManager) CancelBatchTask(batchID string) (map[string]interface{},
 		return nil, err
 	}
 
-	for k, v := range bm.header {
-		req.Header.Set(k, v)
-	}
+	bm.setJSONAuth(req, mc)
 
 	client := &http.Client{}
 	resp, err := client.Do(req)
@@ -305,7 +291,7 @@ func (bm *BatchManager) CancelBatchTask(batchID string) (map[string]interface{},
 }
 
 // QueryBatchTask 查询批量任务状态
-func (bm *BatchManager) QueryBatchTask(batchID string) (map[string]interface{}, error) {
+func (bm *BatchManager) QueryBatchTask(batchID string, mc ModelConfig) (map[string]interface{}, error) {
 	bm.waitRateLimit()
 	url := fmt.Sprintf("https://spark-api-open.xf-yun.com/v1/batches/%s", batchID)
 
@@ -314,9 +300,7 @@ func (bm *BatchManager) QueryBatchTask(batchID string) (map[string]interface{}, 
 		return nil, err
 	}
 
-	for k, v := range bm.header {
-		req.Header.Set(k, v)
-	}
+	bm.setJSONAuth(req, mc)
 
 	client := &http.Client{}
 	resp, err := client.Do(req)
@@ -339,8 +323,8 @@ func (bm *BatchManager) QueryBatchTask(batchID string) (map[string]interface{}, 
 }
 
 // GetResult 查询结果
-func (bm *BatchManager) GetResult(batchID string) (*BatchTaskInfo, error) {
-	resp, err := bm.QueryBatchTask(batchID)
+func (bm *BatchManager) GetResult(batchID string, mc ModelConfig) (*BatchTaskInfo, error) {
+	resp, err := bm.QueryBatchTask(batchID, mc)
 	if err != nil {
 		return nil, err
 	}

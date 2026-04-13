@@ -22,6 +22,14 @@ func NewChunkManager(dbManager *DBManager, fileManager *FileManager, batchManage
 	}
 }
 
+func (cm *ChunkManager) modelForTask(taskID string) ModelConfig {
+	fi, err := cm.dbManager.GetFile(taskID)
+	if err != nil || fi == nil {
+		return ModelConf
+	}
+	return fi.Model
+}
+
 // UploadChunk 上传文件块
 func (cm *ChunkManager) UploadChunk(chunkID string, fileData []byte) bool {
 	// 获取文件块信息
@@ -33,7 +41,8 @@ func (cm *ChunkManager) UploadChunk(chunkID string, fileData []byte) bool {
 
 	// 上传文件，完成后直接更新为已上传状态
 	if chunk.UploadFileID == nil {
-		uploadFileID, err := cm.batchManager.UploadFile(chunk.ChunkPath)
+		mc := cm.modelForTask(chunk.TaskID)
+		uploadFileID, err := cm.batchManager.UploadFile(chunk.ChunkPath, mc)
 		if err != nil {
 			logError("上传文件块失败: %v", err)
 			errorMsg := err.Error()
@@ -74,7 +83,8 @@ func (cm *ChunkManager) ChunkStartProcess(chunkID string) bool {
 		return true
 	}
 
-	batchID, err := cm.batchManager.CreateBatchTask(*chunk.UploadFileID)
+	mc := cm.modelForTask(chunk.TaskID)
+	batchID, err := cm.batchManager.CreateBatchTask(*chunk.UploadFileID, mc)
 	if err != nil {
 		logError("创建batch任务失败: %v", err)
 		return false
@@ -120,7 +130,8 @@ func (cm *ChunkManager) DownloadCanceledChunkResult(chunkID string) bool {
 	// 	logInfo("chunk %s 的BatchTaskInfo已为canceled，使用本地缓存", chunkID)
 	// } else {
 	// BatchTaskInfo不存在或状态不是canceled，需要查询远端获取最新状态
-	result, err = cm.batchManager.GetResult(*chunk.BatchID)
+	mc := cm.modelForTask(chunk.TaskID)
+	result, err = cm.batchManager.GetResult(*chunk.BatchID, mc)
 	if err != nil {
 		logError("获取已取消chunk的batch结果失败 %s: %v", chunkID, err)
 		return false
@@ -150,7 +161,7 @@ func (cm *ChunkManager) DownloadCanceledChunkResult(chunkID string) bool {
 		if _, statErr := os.Stat(outputPath); statErr == nil {
 			logInfo("chunk %s 的输出结果文件已存在，跳过下载", chunkID)
 		} else {
-			content, err := cm.batchManager.GetFileContent(result.OutputFileID)
+			content, err := cm.batchManager.GetFileContent(result.OutputFileID, mc)
 			if err == nil {
 				err = cm.fileManager.SaveFile(chunk.TaskID, chunk.ChunkID, content, false)
 				if err != nil {
@@ -171,7 +182,7 @@ func (cm *ChunkManager) DownloadCanceledChunkResult(chunkID string) bool {
 		if _, statErr := os.Stat(errorPath); statErr == nil {
 			logInfo("chunk %s 的错误结果文件已存在，跳过下载", chunkID)
 		} else {
-			content, err := cm.batchManager.GetFileContent(*result.ErrorFileID)
+			content, err := cm.batchManager.GetFileContent(*result.ErrorFileID, mc)
 			if err == nil {
 				err = cm.fileManager.SaveFile(chunk.TaskID, chunk.ChunkID, content, true)
 				if err != nil {
@@ -206,7 +217,8 @@ func (cm *ChunkManager) CheckChunkProcess(chunkID string) bool {
 		return true
 	}
 
-	result, err := cm.batchManager.GetResult(*chunk.BatchID)
+	mc := cm.modelForTask(chunk.TaskID)
+	result, err := cm.batchManager.GetResult(*chunk.BatchID, mc)
 	if err != nil {
 		logError("获取batch结果失败: %v", err)
 		return false
@@ -227,7 +239,7 @@ func (cm *ChunkManager) CheckChunkProcess(chunkID string) bool {
 
 	if result.IsFinished() {
 		if result.OutputFileID != "" {
-			content, err := cm.batchManager.GetFileContent(result.OutputFileID)
+			content, err := cm.batchManager.GetFileContent(result.OutputFileID, mc)
 			if err == nil {
 				err = cm.fileManager.SaveFile(chunk.TaskID, chunk.ChunkID, content, false)
 				if err != nil {
@@ -241,7 +253,7 @@ func (cm *ChunkManager) CheckChunkProcess(chunkID string) bool {
 		}
 
 		if result.ErrorFileID != nil && *result.ErrorFileID != "" {
-			content, err := cm.batchManager.GetFileContent(*result.ErrorFileID)
+			content, err := cm.batchManager.GetFileContent(*result.ErrorFileID, mc)
 			if err == nil {
 				err = cm.fileManager.SaveFile(chunk.TaskID, chunk.ChunkID, content, true)
 				if err != nil {

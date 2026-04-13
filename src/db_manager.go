@@ -175,7 +175,8 @@ func (db *DBManager) initDatabase() {
 			merged_path TEXT,
 			error_message TEXT,
 			retry INTEGER DEFAULT 0,
-			max_retry INTEGER DEFAULT 0
+			max_retry INTEGER DEFAULT 0,
+			model_config TEXT
 		)
 	`)
 	if err != nil {
@@ -211,12 +212,16 @@ func (db *DBManager) initDatabase() {
 
 // CreateFile 创建文件记录
 func (db *DBManager) CreateFile(fileInfo *FileInfo) error {
-	_, err := db.execWithRetry(`
+	modelJSON, err := json.Marshal(fileInfo.Model)
+	if err != nil {
+		return fmt.Errorf("序列化 model 配置失败: %w", err)
+	}
+	_, err = db.execWithRetry(`
 		INSERT INTO files (
 			file_id, original_filename, file_path, file_size,
 			total_chunks, total_lines, status, created_time, updated_time,
-			merged_path, error_message, retry, max_retry
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			merged_path, error_message, retry, max_retry, model_config
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`,
 		fileInfo.TaskID,
 		fileInfo.OriginalFilename,
@@ -231,6 +236,7 @@ func (db *DBManager) CreateFile(fileInfo *FileInfo) error {
 		fileInfo.ErrorMessage,
 		fileInfo.Retry,
 		fileInfo.MaxRetry,
+		string(modelJSON),
 	)
 	return err
 }
@@ -243,10 +249,11 @@ func (db *DBManager) GetFile(fileID string) (*FileInfo, error) {
 	}
 
 	var fileInfo FileInfo
+	var modelConfigJSON sql.NullString
 	err = conn.QueryRow(`
 		SELECT file_id, original_filename, file_path, file_size,
 		       total_chunks, total_lines, status, created_time, updated_time,
-		       merged_path, error_message, retry, max_retry
+		       merged_path, error_message, retry, max_retry, model_config
 		FROM files WHERE file_id = ?
 	`, fileID).Scan(
 		&fileInfo.TaskID,
@@ -262,6 +269,7 @@ func (db *DBManager) GetFile(fileID string) (*FileInfo, error) {
 		&fileInfo.ErrorMessage,
 		&fileInfo.Retry,
 		&fileInfo.MaxRetry,
+		&modelConfigJSON,
 	)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -273,6 +281,10 @@ func (db *DBManager) GetFile(fileID string) (*FileInfo, error) {
 			return db.GetFile(fileID)
 		}
 		return nil, err
+	}
+
+	if modelConfigJSON.Valid && modelConfigJSON.String != "" {
+		_ = json.Unmarshal([]byte(modelConfigJSON.String), &fileInfo.Model)
 	}
 
 	// 获取文件块
@@ -649,6 +661,30 @@ func (db *DBManager) GetPendingFiles() ([]string, error) {
 		WHERE status IN (?, ?)
 		ORDER BY created_time ASC
 	`, string(FileStatusSplitCompleted), string(FileStatusProcessing))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var fileIDs []string
+	for rows.Next() {
+		var fileID string
+		if err := rows.Scan(&fileID); err == nil {
+			fileIDs = append(fileIDs, fileID)
+		}
+	}
+
+	return fileIDs, nil
+}
+
+// GetCancelingFiles 获取状态为「取消中」的文件（等待 chunk 全部结束后由守护进程置为已取消）
+func (db *DBManager) GetCancelingFiles() ([]string, error) {
+	rows, err := db.queryWithRetry(`
+		SELECT file_id 
+		FROM files 
+		WHERE status = ?
+		ORDER BY created_time ASC
+	`, string(FileStatusCanceling))
 	if err != nil {
 		return nil, err
 	}

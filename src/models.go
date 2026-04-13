@@ -24,9 +24,15 @@ const (
 	FileStatusSplitCompleted   FileStatus = "split_completed"
 	FileStatusProcessing       FileStatus = "processing"
 	FileStatusProcessCompleted FileStatus = "process_completed"
-	FileStatusCanceled         FileStatus = "canceled"
+	FileStatusCanceling        FileStatus = "canceling" // 取消中：chunk 尚未全部结束
+	FileStatusCanceled         FileStatus = "canceled"  // 已取消：所有 chunk 已为 processed 或 canceled
 	FileStatusFailed           FileStatus = "failed"
 )
+
+// FileCancelRequested 是否已请求取消（取消中或已取消终态）
+func FileCancelRequested(s FileStatus) bool {
+	return s == FileStatusCanceling || s == FileStatusCanceled
+}
 
 // BatchStatus 批处理任务状态
 type BatchStatus string
@@ -75,6 +81,8 @@ type FileInfo struct {
 	ErrorMessage     *string      `json:"error_message,omitempty"`
 	Retry            int          `json:"retry"`
 	MaxRetry         int          `json:"max_retry"` // 最大重试次数
+	// Model 分割任务创建时快照的模型配置；守护进程处理该文件时以此为准，而非进程内全局 ModelConf
+	Model ModelConfig `json:"model"`
 }
 
 // BatchTaskInfo 批处理任务信息

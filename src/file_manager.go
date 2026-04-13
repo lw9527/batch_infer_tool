@@ -8,12 +8,206 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
 )
+
+const scannerMaxTokenSize = 100 * 1024 * 1024
+
+type customIDOnlyRecord struct {
+	CustomID string `json:"custom_id"`
+}
+
+type mergedOutputRecord struct {
+	CustomID string          `json:"custom_id"`
+	Request  json.RawMessage `json:"request"`
+	Response json.RawMessage `json:"response"`
+}
+
+type chunkInputRecord struct {
+	CustomID string          `json:"custom_id"`
+	Body     json.RawMessage `json:"body"`
+}
+
+type chunkMergeResult struct {
+	index          int
+	chunkID        string
+	outputLines    []string
+	errorLines     []string
+	missingBodies  []json.RawMessage
+	missingIDs     []string
+	logEachMissing bool
+	completedCount int
+	totalCount     int
+}
+
+func parseCustomID(line []byte) (string, error) {
+	var record customIDOnlyRecord
+	if err := json.Unmarshal(line, &record); err != nil {
+		return "", err
+	}
+	if record.CustomID == "" {
+		return "", errors.New("missing custom_id")
+	}
+	return record.CustomID, nil
+}
+
+func parseChunkInputLine(line []byte) (string, json.RawMessage, error) {
+	var record chunkInputRecord
+	if err := json.Unmarshal(line, &record); err != nil {
+		return "", nil, err
+	}
+	if record.CustomID == "" {
+		return "", nil, errors.New("missing custom_id")
+	}
+	return record.CustomID, record.Body, nil
+}
+
+func (fm *FileManager) mergeSingleChunk(taskID string, chunk *FileChunk, index int) (*chunkMergeResult, error) {
+	estimatedRecords := LINES_PER_CHUNK
+	if estimatedRecords <= 0 {
+		estimatedRecords = 1024
+	}
+	if chunk.BatchTaskInfo != nil && chunk.BatchTaskInfo.TotalCount > 0 {
+		estimatedRecords = chunk.BatchTaskInfo.TotalCount
+	}
+
+	result := &chunkMergeResult{
+		index:          index,
+		chunkID:        chunk.ChunkID,
+		outputLines:    make([]string, 0, estimatedRecords),
+		errorLines:     make([]string, 0, estimatedRecords/8+1),
+		missingBodies:  make([]json.RawMessage, 0, estimatedRecords/4+1),
+		missingIDs:     make([]string, 0, estimatedRecords/4+1),
+		logEachMissing: chunk.BatchTaskInfo != nil && chunk.BatchTaskInfo.CompletedCount != chunk.BatchTaskInfo.TotalCount,
+	}
+	if chunk.BatchTaskInfo != nil {
+		result.completedCount = chunk.BatchTaskInfo.CompletedCount
+		result.totalCount = chunk.BatchTaskInfo.TotalCount
+	}
+
+	chunkPath := chunk.ChunkPath
+	if _, err := os.Stat(chunkPath); os.IsNotExist(err) {
+		return result, nil
+	}
+
+	chunkCustomIDs := make(map[string]struct{}, estimatedRecords)
+	chunkRawLines := make(map[string]json.RawMessage, estimatedRecords)
+	chunkBodyByID := make(map[string]json.RawMessage, estimatedRecords)
+
+	file, err := os.Open(chunkPath)
+	if err != nil {
+		return nil, err
+	}
+	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 0, 64*1024), scannerMaxTokenSize)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		lineBytes := []byte(line)
+		customID, bodyRaw, err := parseChunkInputLine(lineBytes)
+		if err != nil {
+			logInfo("警告: 解析chunk记录失败: %v", err)
+			continue
+		}
+		chunkCustomIDs[customID] = struct{}{}
+		chunkRawLines[customID] = append([]byte(nil), lineBytes...)
+		if len(bodyRaw) > 0 {
+			chunkBodyByID[customID] = append([]byte(nil), bodyRaw...)
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		file.Close()
+		return nil, err
+	}
+	file.Close()
+
+	outputCustomIDs := make(map[string]struct{}, estimatedRecords)
+	outputFile := filepath.Join(BATCH_RESULT_DIR, taskID, "output", fmt.Sprintf("retry%d_%s.jsonl", chunk.Retry, chunk.ChunkID))
+	if _, err := os.Stat(outputFile); err == nil {
+		file, err := os.Open(outputFile)
+		if err != nil {
+			return nil, err
+		}
+		scanner := bufio.NewScanner(file)
+		scanner.Buffer(make([]byte, 0, 64*1024), scannerMaxTokenSize)
+		for scanner.Scan() {
+			line := strings.TrimSpace(scanner.Text())
+			if line == "" {
+				continue
+			}
+			lineBytes := []byte(line)
+			customID, err := parseCustomID(lineBytes)
+			if err != nil {
+				logInfo("警告: 解析output记录失败: %v", err)
+				continue
+			}
+			outputCustomIDs[customID] = struct{}{}
+
+			request := json.RawMessage([]byte("{}"))
+			if raw, ok := chunkRawLines[customID]; ok {
+				request = raw
+			}
+			newRecordJSON, err := json.Marshal(mergedOutputRecord{
+				CustomID: customID,
+				Request:  request,
+				Response: json.RawMessage(lineBytes),
+			})
+			if err != nil {
+				logInfo("警告: 序列化新记录失败: %v", err)
+				continue
+			}
+			result.outputLines = append(result.outputLines, string(newRecordJSON))
+		}
+		if err := scanner.Err(); err != nil {
+			file.Close()
+			return nil, err
+		}
+		file.Close()
+	}
+
+	errorFile := filepath.Join(BATCH_RESULT_DIR, taskID, "error", fmt.Sprintf("retry%d_%s.jsonl", chunk.Retry, chunk.ChunkID))
+	if _, err := os.Stat(errorFile); err == nil {
+		file, err := os.Open(errorFile)
+		if err != nil {
+			return nil, err
+		}
+		scanner := bufio.NewScanner(file)
+		scanner.Buffer(make([]byte, 0, 64*1024), scannerMaxTokenSize)
+		for scanner.Scan() {
+			line := strings.TrimSpace(scanner.Text())
+			if line != "" {
+				result.errorLines = append(result.errorLines, line)
+			}
+		}
+		if err := scanner.Err(); err != nil {
+			file.Close()
+			return nil, err
+		}
+		file.Close()
+	}
+
+	for customID := range chunkCustomIDs {
+		if _, ok := outputCustomIDs[customID]; ok {
+			continue
+		}
+		if body, ok := chunkBodyByID[customID]; ok && len(body) > 0 {
+			result.missingBodies = append(result.missingBodies, body)
+		} else {
+			result.missingBodies = append(result.missingBodies, json.RawMessage([]byte("{}")))
+		}
+		result.missingIDs = append(result.missingIDs, customID)
+	}
+
+	return result, nil
+}
 
 // FileManager 文件管理器
 type FileManager struct {
@@ -117,7 +311,7 @@ func ValidateMessage(message interface{}) error {
 	return nil
 }
 
-func CheckFileFormat(file *os.File) error {
+func CheckFileFormat(file *os.File, mc ModelConfig) error {
 	if file == nil {
 		return fmt.Errorf("file si nil")
 	}
@@ -135,9 +329,9 @@ func CheckFileFormat(file *os.File) error {
 		if err := json.Unmarshal([]byte(line), &originJSON); err != nil {
 			return fmt.Errorf("err in line %d: %s", currentLine, err.Error())
 		}
-		messages, ok := originJSON[ModelConf.MessagesKey].([]interface{})
+		messages, ok := originJSON[mc.MessagesKey].([]interface{})
 		if !ok {
-			return fmt.Errorf("err in line %d: %s(%s) is wrong", currentLine, ModelConf.MessagesKey, originJSON[ModelConf.MessagesKey])
+			return fmt.Errorf("err in line %d: %s(%s) is wrong", currentLine, mc.MessagesKey, originJSON[mc.MessagesKey])
 		}
 		for _, message := range messages {
 			if err := ValidateMessage(message); err != nil {
@@ -150,8 +344,8 @@ func CheckFileFormat(file *os.File) error {
 
 }
 
-// SplitFile 分割文件（按行数）
-func (fm *FileManager) SplitFile(filePath string, originalFilename string, taskID string, linesPerChunk int) (*FileInfo, error) {
+// SplitFile 分割文件（按行数）；modelCfg 会写入 FileInfo 供后续上传/批处理使用
+func (fm *FileManager) SplitFile(filePath string, originalFilename string, taskID string, linesPerChunk int, modelCfg ModelConfig) (*FileInfo, error) {
 	file, err := os.Open(filePath)
 	if err != nil {
 		return nil, fmt.Errorf("文件不存在: %s", filePath)
@@ -178,6 +372,7 @@ func (fm *FileManager) SplitFile(filePath string, originalFilename string, taskI
 		Chunks:           []*FileChunk{},
 		Retry:            0,
 		MaxRetry:         MAX_RETRY_COUNT, // 在分割文件时写入最大重试次数
+		Model:            modelCfg,
 	}
 
 	// 保存文件信息到数据库
@@ -199,7 +394,7 @@ func (fm *FileManager) SplitFile(filePath string, originalFilename string, taskI
 	chunkIndex := 0
 	currentChunkLines := []string{}
 	totalLines := 0
-	currentChunkSize := 0                  // 当前chunk的累计大小（字节数）
+	currentChunkSize := 0                 // 当前chunk的累计大小（字节数）
 	const maxChunkSize = 99 * 1024 * 1024 // 100M = 104857600 字节 需要考虑header大小
 
 	// 检查文件是否为空
@@ -209,6 +404,7 @@ func (fm *FileManager) SplitFile(filePath string, originalFilename string, taskI
 		return fileInfoObj, nil
 	}
 
+	mc := fileInfoObj.Model
 	lineCount := 0
 	for scanner.Scan() {
 		lineCount++
@@ -225,32 +421,32 @@ func (fm *FileManager) SplitFile(filePath string, originalFilename string, taskI
 		}
 
 		// 构建新行
-		messages, ok := originJSON[ModelConf.MessagesKey].([]interface{})
+		messages, ok := originJSON[mc.MessagesKey].([]interface{})
 		if !ok {
 			continue
 		}
 		body := map[string]interface{}{
-			"model":      ModelConf.Domain,
+			"model":      mc.Domain,
 			"messages":   messages,
-			"max_tokens": ModelConf.MaxTokens,
+			"max_tokens": mc.MaxTokens,
 		}
-		if ModelConf.Temperature != nil {
-			body["temperature"] = *ModelConf.Temperature
+		if mc.Temperature != nil {
+			body["temperature"] = *mc.Temperature
 		}
-		if ModelConf.TopP != nil {
-			body["top_p"] = *ModelConf.TopP
+		if mc.TopP != nil {
+			body["top_p"] = *mc.TopP
 		}
-		if ModelConf.EnableThinking != nil {
-			body["enable_thinking"] = *ModelConf.EnableThinking
+		if mc.EnableThinking != nil {
+			body["enable_thinking"] = *mc.EnableThinking
 		}
-		if ModelConf.ExtraBody != nil && len(ModelConf.ExtraBody) > 0 {
-			body["extra_body"] = ModelConf.ExtraBody
+		if mc.ExtraBody != nil && len(mc.ExtraBody) > 0 {
+			body["extra_body"] = mc.ExtraBody
 		}
-		if ModelConf.Tools != nil && len(ModelConf.Tools) > 0 {
-			body["tools"] = ModelConf.Tools
+		if mc.Tools != nil && len(mc.Tools) > 0 {
+			body["tools"] = mc.Tools
 		}
-		if ModelConf.ToolChoice != nil {
-			body["tool_choice"] = ModelConf.ToolChoice
+		if mc.ToolChoice != nil {
+			body["tool_choice"] = mc.ToolChoice
 		}
 		newline := map[string]interface{}{
 			"custom_id": fmt.Sprintf("%d", lineCount),
@@ -362,7 +558,7 @@ func (fm *FileManager) MergeBatchResults(taskID string, retry int) (map[string]i
 	if err != nil || fileInfo == nil {
 		return nil, fmt.Errorf("文件不存在: %s", taskID)
 	}
-	
+
 	// 创建merged目录
 	mergedDir := filepath.Join(MERGED_DIR, taskID)
 	if err := os.MkdirAll(mergedDir, 0755); err != nil {
@@ -386,213 +582,201 @@ func (fm *FileManager) MergeBatchResults(taskID string, retry int) (map[string]i
 		return chunks[i].ChunkIndex < chunks[j].ChunkIndex
 	})
 
-	// 用于存储所有output和error记录
-	allOutputLines := []string{}
-	allErrorLines := []string{}
-	missingRecords := []string{}
+	outputCount := 0
+	errorCount := 0
+	missingCount := 0
 
 	// 确定输出文件名（根据retry参数）
 	outputMergedPath := filepath.Join(mergedDir, fmt.Sprintf("output_retry%d.jsonl", retry))
 	errorMergedPath := filepath.Join(mergedDir, fmt.Sprintf("error_retry%d.jsonl", retry))
 	missingRecordsPath := filepath.Join(mergedDir, fmt.Sprintf("missing_records_retry%d.jsonl", retry))
 
-	// 处理所有chunks
-	for _, chunk := range chunks {
-		// 读取chunk文件，获取所有custom_id
-		chunkPath := chunk.ChunkPath
-		if _, err := os.Stat(chunkPath); os.IsNotExist(err) {
-			logInfo("警告: chunk文件不存在: %s", chunkPath)
-			continue
-		}
+	// 创建输出文件（流式写入，避免巨量内存占用）
+	outputMergedFile, err := os.Create(outputMergedPath)
+	if err != nil {
+		return nil, err
+	}
+	defer outputMergedFile.Close()
+	outputWriter := bufio.NewWriterSize(outputMergedFile, 4*1024*1024)
+	defer outputWriter.Flush()
 
-		chunkCustomIDs := make(map[string]bool)
-		chunkRecords := make(map[string]map[string]interface{})
+	errorMergedFile, err := os.Create(errorMergedPath)
+	if err != nil {
+		return nil, err
+	}
+	defer errorMergedFile.Close()
+	errorWriter := bufio.NewWriterSize(errorMergedFile, 4*1024*1024)
+	defer errorWriter.Flush()
 
-		file, err := os.Open(chunkPath)
-		if err != nil {
-			continue
-		}
+	missingMergedFile, err := os.Create(missingRecordsPath)
+	if err != nil {
+		return nil, err
+	}
+	defer missingMergedFile.Close()
+	missingWriter := bufio.NewWriterSize(missingMergedFile, 4*1024*1024)
+	defer missingWriter.Flush()
 
-		scanner := bufio.NewScanner(file)
-		scanner.Buffer(make([]byte, 100*1024*1024), 100*1024*1024)
-		for scanner.Scan() {
-			line := strings.TrimSpace(scanner.Text())
-			if line == "" {
-				continue
-			}
-
-			var record map[string]interface{}
-			if err := json.Unmarshal([]byte(line), &record); err != nil {
-				logInfo("警告: 解析chunk记录失败: %v", err)
-				continue
-			}
-
-			customID, _ := record["custom_id"].(string)
-			chunkCustomIDs[customID] = true
-			chunkRecords[customID] = record
-		}
-		
-		file.Close()
-
-		// 读取output文件（根据retry值选择文件名）
-		outputFile := filepath.Join(BATCH_RESULT_DIR, taskID, "output", fmt.Sprintf("retry%d_%s.jsonl", chunk.Retry, chunk.ChunkID))
-		outputCustomIDs := make(map[string]bool)
-
-		if _, err := os.Stat(outputFile); err == nil {
-			file, err := os.Open(outputFile)
-			if err == nil {
-				scanner := bufio.NewScanner(file)
-				// 增大缓冲区大小到1MB，因为单行可能超过默认64KB
-				scanner.Buffer(make([]byte, 100*1024*1024), 100*1024*1024)
-				for scanner.Scan() {
-					line := strings.TrimSpace(scanner.Text())
-					if line == "" {
-						continue
-					}
-
-					var outputRecord map[string]interface{}
-					if err := json.Unmarshal([]byte(line), &outputRecord); err != nil {
-						logInfo("警告: 解析output记录失败: %v", err)
-						continue
-					}
-
-					customID, _ := outputRecord["custom_id"].(string)
-					outputCustomIDs[customID] = true
-					
-					// 构建包含custom_id, request, response的新记录
-					newRecord := map[string]interface{}{
-						"custom_id": customID,
-					}
-					
-					// 从chunkRecords中获取原始请求
-					if requestRecord, ok := chunkRecords[customID]; ok {
-						newRecord["request"] = requestRecord
-					} else {
-						// 如果找不到原始请求，使用空对象
-						newRecord["request"] = map[string]interface{}{}
-					}
-					
-					// 如果output记录有response字段，使用它；否则使用整个output记录		
-					newRecord["response"] = outputRecord
-					
-					// 序列化为JSON字符串
-					newRecordJSON, err := json.Marshal(newRecord)
-					if err != nil {
-						logInfo("警告: 序列化新记录失败: %v", err)
-						continue
-					}
-					
-					allOutputLines = append(allOutputLines, string(newRecordJSON))
-				}
-				// 检查scanner是否有错误
-				if err := scanner.Err(); err != nil {
-					logInfo("警告: 读取output文件失败: %v", err)
-				}
-				file.Close()
-			}
-		}
-
-		// 读取error文件（根据retry值选择文件名）
-		errorFile := filepath.Join(BATCH_RESULT_DIR, taskID, "error", fmt.Sprintf("retry%d_%s.jsonl", chunk.Retry, chunk.ChunkID))
-
-		if _, err := os.Stat(errorFile); err == nil {
-			file, err := os.Open(errorFile)
-			if err == nil {
-				scanner := bufio.NewScanner(file)
-				scanner.Buffer(make([]byte, 100*1024*1024), 100*1024*1024)
-				for scanner.Scan() {
-					line := strings.TrimSpace(scanner.Text())
-					if line != "" {
-						allErrorLines = append(allErrorLines, line)
-					}
-				}
-				if err := scanner.Err(); err != nil {
-					logInfo("警告: 读取error文件失败: %v", err)
-				}
-				file.Close()
-			}
-		}
-
-		// 检查是否有缺失的记录
-		missingCustomIDs := []string{}
-		for customID := range chunkCustomIDs {
-			if !outputCustomIDs[customID] {
-				missingCustomIDs = append(missingCustomIDs, customID)
-			}
-		}
-
-		// 如果completed_count != total_count，检查并保存缺失的记录
-		if chunk.BatchTaskInfo != nil && chunk.BatchTaskInfo.CompletedCount != chunk.BatchTaskInfo.TotalCount {
-			for _, customID := range missingCustomIDs {
-				if record, ok := chunkRecords[customID]; ok {
-					recordJSON, _ := json.Marshal(record)
-					missingRecords = append(missingRecords, string(recordJSON))
-					logInfo("发现缺失记录: chunk_id=%s, custom_id=%s, completed=%d, total=%d",
-						chunk.ChunkID, customID, chunk.BatchTaskInfo.CompletedCount, chunk.BatchTaskInfo.TotalCount)
-				}
-			}
-		} else if len(missingCustomIDs) > 0 {
-			logInfo("警告: chunk_id=%s 虽然completed_count==total_count，但发现缺失记录: %d条", chunk.ChunkID, len(missingCustomIDs))
-			for _, customID := range missingCustomIDs {
-				if record, ok := chunkRecords[customID]; ok {
-					recordJSON, _ := json.Marshal(record)
-					missingRecords = append(missingRecords, string(recordJSON))
-				}
-			}
-		}
+	workerCount := runtime.NumCPU()
+	if workerCount < 2 {
+		workerCount = 2
+	}
+	if workerCount > 16 {
+		workerCount = 16
+	}
+	if workerCount > len(chunks) {
+		workerCount = len(chunks)
+	}
+	if workerCount <= 0 {
+		workerCount = 1
 	}
 
-	// 写入合并后的output文件
-	outputFile, err := os.Create(outputMergedPath)
-	if err == nil {
-		for _, line := range allOutputLines {
-			outputFile.WriteString(line + "\n")
-		}
-		outputFile.Close()
+	type chunkJob struct {
+		index int
+		chunk *FileChunk
 	}
 
-	// 写入合并后的error文件
-	errorFile, err := os.Create(errorMergedPath)
-	if err == nil {
-		for _, line := range allErrorLines {
-			errorFile.WriteString(line + "\n")
-		}
-		errorFile.Close()
+	jobs := make(chan chunkJob, workerCount*2)
+	results := make(chan *chunkMergeResult, workerCount*2)
+	errCh := make(chan error, 1)
+
+	var wg sync.WaitGroup
+	for i := 0; i < workerCount; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for job := range jobs {
+				res, err := fm.mergeSingleChunk(taskID, job.chunk, job.index)
+				if err != nil {
+					select {
+					case errCh <- err:
+					default:
+					}
+					return
+				}
+				if res == nil {
+					continue
+				}
+				results <- res
+			}
+		}()
 	}
 
-	// 写入缺失记录文件
-	missingFile, err := os.Create(missingRecordsPath)
-	if err == nil {
-		for _, record := range missingRecords {
-			missingFile.WriteString(record + "\n")
+	go func() {
+		for idx, chunk := range chunks {
+			jobs <- chunkJob{index: idx, chunk: chunk}
 		}
-		missingFile.Close()
+		close(jobs)
+		wg.Wait()
+		close(results)
+	}()
+
+	pending := make(map[int]*chunkMergeResult, workerCount*2)
+	nextIndex := 0
+	flushResult := func(res *chunkMergeResult) error {
+		for _, line := range res.outputLines {
+			if _, err := outputWriter.WriteString(line); err != nil {
+				return err
+			}
+			if err := outputWriter.WriteByte('\n'); err != nil {
+				return err
+			}
+			outputCount++
+		}
+		for _, line := range res.errorLines {
+			if _, err := errorWriter.WriteString(line); err != nil {
+				return err
+			}
+			if err := errorWriter.WriteByte('\n'); err != nil {
+				return err
+			}
+			errorCount++
+		}
+		if res.logEachMissing {
+			for i, body := range res.missingBodies {
+				if _, err := missingWriter.Write(body); err != nil {
+					return err
+				}
+				if err := missingWriter.WriteByte('\n'); err != nil {
+					return err
+				}
+				missingCount++
+				logInfo("发现缺失记录: chunk_id=%s, custom_id=%s, completed=%d, total=%d",
+					res.chunkID, res.missingIDs[i], res.completedCount, res.totalCount)
+			}
+		} else {
+			for _, body := range res.missingBodies {
+				if _, err := missingWriter.Write(body); err != nil {
+					return err
+				}
+				if err := missingWriter.WriteByte('\n'); err != nil {
+					return err
+				}
+				missingCount++
+			}
+			if len(res.missingBodies) > 0 {
+				logInfo("警告: chunk_id=%s 虽然completed_count==total_count，但发现缺失记录: %d条", res.chunkID, len(res.missingBodies))
+			}
+		}
+		return nil
+	}
+
+	for res := range results {
+		pending[res.index] = res
+		for {
+			ready, ok := pending[nextIndex]
+			if !ok {
+				break
+			}
+			if err := flushResult(ready); err != nil {
+				return nil, err
+			}
+			delete(pending, nextIndex)
+			nextIndex++
+		}
+	}
+	select {
+	case err := <-errCh:
+		return nil, err
+	default:
+	}
+
+	if err := outputWriter.Flush(); err != nil {
+		return nil, err
+	}
+	if err := errorWriter.Flush(); err != nil {
+		return nil, err
+	}
+	if err := missingWriter.Flush(); err != nil {
+		return nil, err
 	}
 
 	result := map[string]interface{}{
 		"output_file":          outputMergedPath,
 		"error_file":           errorMergedPath,
 		"missing_records_file": missingRecordsPath,
-		"missing_count":        len(missingRecords),
+		"missing_count":        missingCount,
 	}
 
 	// 使用文件表中的 max_retry 字段，而不是全局的 MAX_RETRY_COUNT
 	maxRetry := fileInfo.MaxRetry
 	// 只有当没有缺失记录，或者达到最大重试次数时，才完成处理
 	// 注意：即使达到最大重试次数，如果还有缺失记录，也应该完成处理（不再重试）
-	shouldComplete := len(missingRecords) == 0 || retry >= maxRetry
-	
+	shouldComplete := missingCount == 0 || retry >= maxRetry
+
 	if shouldComplete {
 		// 如果达到最大重试次数但仍有缺失记录，记录警告
-		if retry >= maxRetry && len(missingRecords) > 0 {
-			logInfo("已达到最大重试次数 (%d)，仍有 %d 条缺失记录，停止重试", maxRetry, len(missingRecords))
+		if retry >= maxRetry && missingCount > 0 {
+			logInfo("已达到最大重试次数 (%d)，仍有 %d 条缺失记录，停止重试", maxRetry, missingCount)
 		}
-		
+
 		// 合并之前所有retry级别的output文件
 		finalOutputPath := filepath.Join(mergedDir, "output.jsonl")
-
-		// 用于存储所有output记录
-		allFinalOutputLines := []string{}
+		finalFile, err := os.Create(finalOutputPath)
+		if err != nil {
+			return nil, err
+		}
+		finalWriter := bufio.NewWriterSize(finalFile, 4*1024*1024)
+		finalCount := 0
 
 		// 按retry级别从0到retry读取并合并
 		for retryLevel := 0; retryLevel <= retry; retryLevel++ {
@@ -602,28 +786,37 @@ func (fm *FileManager) MergeBatchResults(taskID string, retry int) (map[string]i
 				file, err := os.Open(retryOutputPath)
 				if err == nil {
 					scanner := bufio.NewScanner(file)
-					scanner.Buffer(make([]byte, 100*1024*1024), 100*1024*1024)
+					scanner.Buffer(make([]byte, 0, 64*1024), scannerMaxTokenSize)
 					for scanner.Scan() {
 						line := strings.TrimSpace(scanner.Text())
 						if line != "" {
-							allFinalOutputLines = append(allFinalOutputLines, line)
+							if _, err := finalWriter.WriteString(line); err != nil {
+								file.Close()
+								finalFile.Close()
+								return nil, err
+							}
+							if err := finalWriter.WriteByte('\n'); err != nil {
+								file.Close()
+								finalFile.Close()
+								return nil, err
+							}
+							finalCount++
 						}
+					}
+					if err := scanner.Err(); err != nil {
+						logInfo("警告: 读取最终合并文件失败: %v", err)
 					}
 					file.Close()
 				}
 			}
 		}
-
-		// 写入最终的output文件
-		finalFile, err := os.Create(finalOutputPath)
-		if err == nil {
-			for _, line := range allFinalOutputLines {
-				finalFile.WriteString(line + "\n")
-			}
+		if err := finalWriter.Flush(); err != nil {
 			finalFile.Close()
+			return nil, err
 		}
+		finalFile.Close()
 
-		logInfo("最终合并完成: output=%d条", len(allFinalOutputLines))
+		logInfo("最终合并完成: output=%d条", finalCount)
 		logInfo("最终文件路径: output=%s", finalOutputPath)
 
 		result["final_output_file"] = finalOutputPath
@@ -632,7 +825,7 @@ func (fm *FileManager) MergeBatchResults(taskID string, retry int) (map[string]i
 		fileInfo.Status = FileStatusProcessCompleted
 	}
 
-	logInfo("合并完成: output=%d条, error=%d条, 缺失=%d条", len(allOutputLines), len(allErrorLines), len(missingRecords))
+	logInfo("合并完成: output=%d条, error=%d条, 缺失=%d条", outputCount, errorCount, missingCount)
 
 	return result, nil
 }
@@ -644,7 +837,8 @@ func (fm *FileManager) RetryFailedRecords(taskID string) (bool, error) {
 		return false, fmt.Errorf("文件不存在: %s", taskID)
 	}
 
-	if fileInfo.Status == FileStatusFailed || fileInfo.Status == FileStatusProcessCompleted || fileInfo.Status == FileStatusCanceled {
+	if fileInfo.Status == FileStatusFailed || fileInfo.Status == FileStatusProcessCompleted ||
+		fileInfo.Status == FileStatusCanceled || fileInfo.Status == FileStatusCanceling {
 		logInfo("文件状态为 %s，跳过重试", fileInfo.Status)
 		return true, nil
 	}
@@ -701,7 +895,7 @@ func (fm *FileManager) RetryFailedRecords(taskID string) (bool, error) {
 	// 分割缺失记录（同时检查行数和文件大小，限制100M）
 	chunkIndex := 0
 	currentChunkLines := []string{}
-	currentChunkSize := 0                  // 当前chunk的累计大小（字节数）
+	currentChunkSize := 0                 // 当前chunk的累计大小（字节数）
 	const maxChunkSize = 99 * 1024 * 1024 // 100M = 104857600 字节 需要考虑header大小
 
 	for _, recordLine := range missingRecords {
