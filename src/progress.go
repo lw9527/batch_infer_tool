@@ -204,14 +204,11 @@ func (p *ProgressDisplay) ShowStatus(fileInfo *FileInfo, clearScreen bool) {
 	summary := fileInfo.GetStatusSummary()
 	total := summary.Total
 	if total["pending"] == summary.TotalChunks && summary.TotalChunks > 0 {
-		serviceID := fileInfo.Model.ServiceID
-		if serviceID == "" {
-			serviceID = fileInfo.Model.Domain
-		}
+		serviceID = fileInfo.Model.Domain}
 		deployValue, usedValue, totalValue := getServiceInfo(serviceID)
 		if totalValue <= 0 {
-			statusMsg := fmt.Sprintf("\n 文件: %s | task_id: %s \n 引擎%s未就绪，monitor=%d, pipeline=%d/%d，等待服务启动...",
-				fileInfo.OriginalFilename, fileInfo.TaskID, serviceID, deployValue, usedValue, totalValue)
+			statusMsg := fmt.Sprintf("\n 文件: %s | task_id: %s \n 引擎%s未就绪，等待服务启动...",
+				fileInfo.OriginalFilename, fileInfo.TaskID, serviceID)
 			if clearScreen {
 				clearScreenFunc()
 			}
