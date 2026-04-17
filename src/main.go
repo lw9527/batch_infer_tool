@@ -203,7 +203,7 @@ func (bis *BatchInferService) UploadAndProcessLoop(taskID string) {
 			break
 		}
 		if fileInfo.Status == FileStatusCanceling {
-			logInfo("文件 %s 处于取消中，由守护进程轮询收尾，跳过本流程", taskID)
+			logInfo("文件 %s 处于取消中，由守护进程轮询收尾", taskID)
 			for {
 				if allSuccess, err := bis.Cancel(taskID); err != nil || !allSuccess {
 					logError("[%s] Cancel: %v", taskID, err)

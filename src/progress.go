@@ -217,9 +217,9 @@ func (p *ProgressDisplay) ShowStatus(fileInfo *FileInfo, clearScreen bool) {
 		}
 	}
 
-	statusMsg := fmt.Sprintf("\n 文件: %s | task_id: %s \n 总块数: %d | 待上传：%d | 已上传: %d | 处理中: %d | 已处理: %d | 上传失败: %d \n 总处理行数: %d | 已完成行数: %d | 失败行数: %d | 重试次数: %d次",
+	statusMsg := fmt.Sprintf("\n 文件: %s | task_id: %s \n 总块数: %d | 待上传：%d | 已上传: %d | 处理中: %d | 已处理: %d | 已取消: %d | 上传失败: %d \n 总处理行数: %d | 已完成行数: %d | 失败行数: %d | 重试次数: %d次",
 		fileInfo.OriginalFilename, fileInfo.TaskID, summary.TotalChunks,
-		total["pending"], total["uploaded"], total["processing"], total["processed"], total["upload_failed"],
+		total["pending"], total["uploaded"], total["processing"], total["processed"], total["canceled"], total["upload_failed"],
 		fileInfo.TotalLines, total["complete_count"], total["failed_count"], fileInfo.Retry)
 
 	// 计算进度条

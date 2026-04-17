@@ -126,6 +126,7 @@ func (f *FileInfo) GetStatusSummary() *StatusSummary {
 	summary.Total["uploaded"] = 0
 	summary.Total["processing"] = 0
 	summary.Total["processed"] = 0
+	summary.Total["canceled"] = 0
 	summary.Total["upload_failed"] = 0
 	summary.Total["total_count"] = 0
 	summary.Total["complete_count"] = 0
@@ -145,6 +146,7 @@ func (f *FileInfo) GetStatusSummary() *StatusSummary {
 			summary.ByRetry[retry]["uploaded"] = 0
 			summary.ByRetry[retry]["processing"] = 0
 			summary.ByRetry[retry]["processed"] = 0
+			summary.ByRetry[retry]["canceled"] = 0
 			summary.ByRetry[retry]["upload_failed"] = 0
 		}
 
@@ -183,6 +185,19 @@ func (f *FileInfo) GetStatusSummary() *StatusSummary {
 		case ChunkStatusProcessed:
 			summary.ByRetry[retry]["processed"]++
 			summary.Total["processed"]++
+			if chunk.BatchTaskInfo != nil {
+				if retry == 0 {
+					summary.Total["total_count"] += chunk.BatchTaskInfo.TotalCount
+					summary.Total["complete_count"] += chunk.BatchTaskInfo.CompletedCount
+					summary.Total["failed_count"] += chunk.BatchTaskInfo.FailedCount
+				} else {
+					summary.Total["complete_count"] += chunk.BatchTaskInfo.CompletedCount
+					summary.Total["failed_count"] -= chunk.BatchTaskInfo.CompletedCount
+				}
+			}
+		case ChunkStatusCanceled:
+			summary.ByRetry[retry]["canceled"]++
+			summary.Total["canceled"]++
 			if chunk.BatchTaskInfo != nil {
 				if retry == 0 {
 					summary.Total["total_count"] += chunk.BatchTaskInfo.TotalCount
