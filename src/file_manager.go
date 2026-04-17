@@ -39,7 +39,7 @@ type chunkMergeResult struct {
 	chunkID        string
 	outputLines    []string
 	errorLines     []string
-	missingBodies  []json.RawMessage
+	missingRetry   []json.RawMessage
 	missingIDs     []string
 	logEachMissing bool
 	completedCount int
@@ -82,7 +82,7 @@ func (fm *FileManager) mergeSingleChunk(taskID string, chunk *FileChunk, index i
 		chunkID:        chunk.ChunkID,
 		outputLines:    make([]string, 0, estimatedRecords),
 		errorLines:     make([]string, 0, estimatedRecords/8+1),
-		missingBodies:  make([]json.RawMessage, 0, estimatedRecords/4+1),
+		missingRetry:   make([]json.RawMessage, 0, estimatedRecords/4+1),
 		missingIDs:     make([]string, 0, estimatedRecords/4+1),
 		logEachMissing: chunk.BatchTaskInfo != nil && chunk.BatchTaskInfo.CompletedCount != chunk.BatchTaskInfo.TotalCount,
 	}
@@ -98,7 +98,6 @@ func (fm *FileManager) mergeSingleChunk(taskID string, chunk *FileChunk, index i
 
 	chunkCustomIDs := make(map[string]struct{}, estimatedRecords)
 	chunkRawLines := make(map[string]json.RawMessage, estimatedRecords)
-	chunkBodyByID := make(map[string]json.RawMessage, estimatedRecords)
 
 	file, err := os.Open(chunkPath)
 	if err != nil {
@@ -112,16 +111,13 @@ func (fm *FileManager) mergeSingleChunk(taskID string, chunk *FileChunk, index i
 			continue
 		}
 		lineBytes := []byte(line)
-		customID, bodyRaw, err := parseChunkInputLine(lineBytes)
+		customID, _, err := parseChunkInputLine(lineBytes)
 		if err != nil {
 			logInfo("警告: 解析chunk记录失败: %v", err)
 			continue
 		}
 		chunkCustomIDs[customID] = struct{}{}
 		chunkRawLines[customID] = append([]byte(nil), lineBytes...)
-		if len(bodyRaw) > 0 {
-			chunkBodyByID[customID] = append([]byte(nil), bodyRaw...)
-		}
 	}
 	if err := scanner.Err(); err != nil {
 		file.Close()
@@ -198,10 +194,10 @@ func (fm *FileManager) mergeSingleChunk(taskID string, chunk *FileChunk, index i
 		if _, ok := outputCustomIDs[customID]; ok {
 			continue
 		}
-		if body, ok := chunkBodyByID[customID]; ok && len(body) > 0 {
-			result.missingBodies = append(result.missingBodies, body)
+		if raw, ok := chunkRawLines[customID]; ok && len(raw) > 0 {
+			result.missingRetry = append(result.missingRetry, raw)
 		} else {
-			result.missingBodies = append(result.missingBodies, json.RawMessage([]byte("{}")))
+			result.missingRetry = append(result.missingRetry, json.RawMessage([]byte("{}")))
 		}
 		result.missingIDs = append(result.missingIDs, customID)
 	}
@@ -344,6 +340,39 @@ func CheckFileFormat(file *os.File, mc ModelConfig) error {
 
 }
 
+// detectRetryInputFormat 检测文件是否为可直接重试的请求格式
+// 判定规则：首条非空 JSON 行同时包含 custom_id/method/url/body 字段
+func detectRetryInputFormat(file *os.File) (bool, error) {
+	if file == nil {
+		return false, fmt.Errorf("file is nil")
+	}
+	if _, err := file.Seek(0, 0); err != nil {
+		return false, err
+	}
+
+	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 0, 64*1024), scannerMaxTokenSize)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		var obj map[string]interface{}
+		if err := json.Unmarshal([]byte(line), &obj); err != nil {
+			return false, nil
+		}
+		_, hasCustomID := obj["custom_id"]
+		_, hasMethod := obj["method"]
+		_, hasURL := obj["url"]
+		_, hasBody := obj["body"]
+		return hasCustomID && hasMethod && hasURL && hasBody, nil
+	}
+	if err := scanner.Err(); err != nil {
+		return false, err
+	}
+	return false, nil
+}
+
 // SplitFile 分割文件（按行数）；modelCfg 会写入 FileInfo 供后续上传/批处理使用
 func (fm *FileManager) SplitFile(filePath string, originalFilename string, taskID string, linesPerChunk int, modelCfg ModelConfig) (*FileInfo, error) {
 	file, err := os.Open(filePath)
@@ -404,6 +433,19 @@ func (fm *FileManager) SplitFile(filePath string, originalFilename string, taskI
 		return fileInfoObj, nil
 	}
 
+	isRetryInput, err := detectRetryInputFormat(file)
+	if err != nil {
+		return nil, fmt.Errorf("检测输入格式失败: %v", err)
+	}
+	if _, err := file.Seek(0, 0); err != nil {
+		return nil, err
+	}
+	scanner = bufio.NewScanner(file)
+	scanner.Buffer(buf, 100*1024*1024)
+	if isRetryInput {
+		logInfo("检测到重试格式输入，按原行直接分割，不使用配置补全参数")
+	}
+
 	mc := fileInfoObj.Model
 	lineCount := 0
 	for scanner.Scan() {
@@ -420,48 +462,54 @@ func (fm *FileManager) SplitFile(filePath string, originalFilename string, taskI
 			continue
 		}
 
-		// 构建新行
-		messages, ok := originJSON[mc.MessagesKey].([]interface{})
-		if !ok {
-			continue
-		}
-		body := map[string]interface{}{
-			"model":      mc.Domain,
-			"messages":   messages,
-			"max_tokens": mc.MaxTokens,
-		}
-		if mc.Temperature != nil {
-			body["temperature"] = *mc.Temperature
-		}
-		if mc.TopP != nil {
-			body["top_p"] = *mc.TopP
-		}
-		if mc.EnableThinking != nil {
-			body["enable_thinking"] = *mc.EnableThinking
-		}
-		if mc.ExtraBody != nil && len(mc.ExtraBody) > 0 {
-			body["extra_body"] = mc.ExtraBody
-		}
-		if mc.Tools != nil && len(mc.Tools) > 0 {
-			body["tools"] = mc.Tools
-		}
-		if mc.ToolChoice != nil {
-			body["tool_choice"] = mc.ToolChoice
-		}
-		newline := map[string]interface{}{
-			"custom_id": fmt.Sprintf("%d", lineCount),
-			"method":    "POST",
-			"url":       "/v1/chat/completions",
-			"body":      body,
-		}
+		var lineForChunk string
+		if isRetryInput {
+			lineForChunk = line
+		} else {
+			// 构建新行
+			messages, ok := originJSON[mc.MessagesKey].([]interface{})
+			if !ok {
+				continue
+			}
+			body := map[string]interface{}{
+				"model":      mc.Domain,
+				"messages":   messages,
+				"max_tokens": mc.MaxTokens,
+			}
+			if mc.Temperature != nil {
+				body["temperature"] = *mc.Temperature
+			}
+			if mc.TopP != nil {
+				body["top_p"] = *mc.TopP
+			}
+			if mc.EnableThinking != nil {
+				body["enable_thinking"] = *mc.EnableThinking
+			}
+			if mc.ExtraBody != nil && len(mc.ExtraBody) > 0 {
+				body["extra_body"] = mc.ExtraBody
+			}
+			if mc.Tools != nil && len(mc.Tools) > 0 {
+				body["tools"] = mc.Tools
+			}
+			if mc.ToolChoice != nil {
+				body["tool_choice"] = mc.ToolChoice
+			}
+			newline := map[string]interface{}{
+				"custom_id": fmt.Sprintf("%d", lineCount),
+				"method":    "POST",
+				"url":       "/v1/chat/completions",
+				"body":      body,
+			}
 
-		newlineJSON, err := json.Marshal(newline)
-		if err != nil {
-			continue
+			newlineJSON, err := json.Marshal(newline)
+			if err != nil {
+				continue
+			}
+			lineForChunk = string(newlineJSON)
 		}
 
 		// 计算当前行的字节大小（包括换行符）
-		lineSize := len(newlineJSON) + 1 // +1 是换行符 \n
+		lineSize := len(lineForChunk) + 1 // +1 是换行符 \n
 		newChunkSize := currentChunkSize + lineSize
 		newChunkLineCount := len(currentChunkLines) + 1
 
@@ -480,7 +528,7 @@ func (fm *FileManager) SplitFile(filePath string, originalFilename string, taskI
 			currentChunkSize = 0
 		}
 
-		currentChunkLines = append(currentChunkLines, string(newlineJSON))
+		currentChunkLines = append(currentChunkLines, lineForChunk)
 		currentChunkSize += lineSize
 		totalLines++
 
@@ -692,8 +740,8 @@ func (fm *FileManager) MergeBatchResults(taskID string, retry int) (map[string]i
 			errorCount++
 		}
 		if res.logEachMissing {
-			for i, body := range res.missingBodies {
-				if _, err := missingWriter.Write(body); err != nil {
+			for i, retryLine := range res.missingRetry {
+				if _, err := missingWriter.Write(retryLine); err != nil {
 					return err
 				}
 				if err := missingWriter.WriteByte('\n'); err != nil {
@@ -704,8 +752,8 @@ func (fm *FileManager) MergeBatchResults(taskID string, retry int) (map[string]i
 					res.chunkID, res.missingIDs[i], res.completedCount, res.totalCount)
 			}
 		} else {
-			for _, body := range res.missingBodies {
-				if _, err := missingWriter.Write(body); err != nil {
+			for _, retryLine := range res.missingRetry {
+				if _, err := missingWriter.Write(retryLine); err != nil {
 					return err
 				}
 				if err := missingWriter.WriteByte('\n'); err != nil {
@@ -713,8 +761,8 @@ func (fm *FileManager) MergeBatchResults(taskID string, retry int) (map[string]i
 				}
 				missingCount++
 			}
-			if len(res.missingBodies) > 0 {
-				logInfo("警告: chunk_id=%s 虽然completed_count==total_count，但发现缺失记录: %d条", res.chunkID, len(res.missingBodies))
+			if len(res.missingRetry) > 0 {
+				logInfo("警告: chunk_id=%s 虽然completed_count==total_count，但发现缺失记录: %d条", res.chunkID, len(res.missingRetry))
 			}
 		}
 		return nil
