@@ -38,7 +38,7 @@ var imageMimeByExt = map[string]string{
 // inferTask 单行 JSON 任务
 type inferTask struct {
 	idValue     interface{}
-	query       string
+	messages    string
 	imgPath     string
 	fullImgPath string
 	inputFile   string
@@ -48,7 +48,7 @@ type inferTask struct {
 // localInferResult 与 image.py 输出字段对齐
 type localInferResult struct {
 	ID          interface{}     `json:"id"`
-	Query       string          `json:"query"`
+	Messages    string          `json:"messages"`
 	ImgPath     string          `json:"img_path,omitempty"`
 	ImagePath   string          `json:"image_path,omitempty"`
 	StartTime   string          `json:"start_time,omitempty"`
@@ -93,7 +93,8 @@ func RunLocalInfer(inputFiles []string) error {
 	cfg := LocalInferConf
 	httpClient := &http.Client{Timeout: time.Duration(cfg.HTTPTimeoutSec) * time.Second}
 
-	var maxWorkers int32 = int32(cfg.InitialWorkers)
+	initialWorkers := waitForServiceReady(mc.Domain, cfg)
+	var maxWorkers int32 = int32(initialWorkers)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -109,18 +110,36 @@ func RunLocalInfer(inputFiles []string) error {
 	return nil
 }
 
+func calcWorkersFromTotal(total int, cfg LocalInferConfig) int {
+	n := int(float64(total) * cfg.ConcurrencyRatio)
+	if n < 1 {
+		n = 1
+	}
+	if n > cfg.MaxPoolCap {
+		n = cfg.MaxPoolCap
+	}
+	return n
+}
+
+func waitForServiceReady(domain string, cfg LocalInferConfig) int {
+	interval := time.Duration(cfg.PrometheusIntervalSec) * time.Second
+	for {
+		total, used, nodeTotal := getServiceInfo(domain)
+		if total > 0 {
+			workers := calcWorkersFromTotal(total, cfg)
+			logInfo("服务已ready: domain=%s total=%d used=%d node_total=%d 并发=%d", domain, total, used, nodeTotal, workers)
+			return workers
+		}
+		logInfo("服务未ready: domain=%s total=%d used=%d node_total=%d，等待%ds后重试", domain, total, used, nodeTotal, cfg.PrometheusIntervalSec)
+		time.Sleep(interval)
+	}
+}
+
 func monitorPrometheusForLocalInfer(ctx context.Context, domain string, maxWorkers *int32, cfg LocalInferConfig) {
 	apply := func() {
 		total, _, _ := getServiceInfo(domain)
 		if total > 0 {
-			n := int(float64(total) * cfg.ConcurrencyRatio)
-			if n < 1 {
-				n = 1
-			}
-			if n > cfg.MaxPoolCap {
-				n = cfg.MaxPoolCap
-			}
-			atomic.StoreInt32(maxWorkers, int32(n))
+			atomic.StoreInt32(maxWorkers, int32(calcWorkersFromTotal(total, cfg)))
 		}
 	}
 	apply()
@@ -190,10 +209,11 @@ func parseInferLine(line []byte, inputFile string, lineNum int) (*inferTask, str
 		return nil, ""
 	}
 	idStr := fmt.Sprintf("%v", idVal)
-	query, _ := row["query"].(string)
-	if strings.TrimSpace(query) == "" {
-		query = defaultUserQuery
+	messageKey := strings.TrimSpace(ModelConf.MessagesKey)
+	if messageKey == "" {
+		messageKey = "messages"
 	}
+	messages, _ := row[messageKey].(string)
 	imgPath, _ := row["img_path"].(string)
 	imgPath = strings.TrimSpace(imgPath)
 
@@ -213,7 +233,7 @@ func parseInferLine(line []byte, inputFile string, lineNum int) (*inferTask, str
 
 	return &inferTask{
 		idValue:     idVal,
-		query:       query,
+		messages:    messages,
 		imgPath:     imgPath,
 		fullImgPath: fullImg,
 		inputFile:   inputFile,
@@ -226,7 +246,7 @@ func buildMessages(mc ModelConfig, task *inferTask) ([]map[string]interface{}, e
 		return []map[string]interface{}{
 			{
 				"role":    "user",
-				"content": task.query,
+				"content": task.messages,
 			},
 		}, nil
 	}
@@ -241,7 +261,7 @@ func buildMessages(mc ModelConfig, task *inferTask) ([]map[string]interface{}, e
 		{
 			"role": "user",
 			"content": []interface{}{
-				map[string]interface{}{"type": "text", "text": task.query},
+				map[string]interface{}{"type": "text", "text": task.messages},
 				map[string]interface{}{
 					"type": "image_url",
 					"image_url": map[string]interface{}{
@@ -346,7 +366,7 @@ func runOneInferTask(ctx context.Context, client *http.Client, mc ModelConfig, t
 	nowStr := func() string { return time.Now().Format("2006-01-02 15:04:05") }
 	res := localInferResult{
 		ID:        task.idValue,
-		Query:     task.query,
+		Messages:  task.messages,
 		ImgPath:   task.imgPath,
 		ImagePath: task.fullImgPath,
 		Success:   false,
