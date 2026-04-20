@@ -38,7 +38,7 @@ var imageMimeByExt = map[string]string{
 // inferTask 单行 JSON 任务
 type inferTask struct {
 	idValue     interface{}
-	messages    string
+	messagesRaw []map[string]interface{}
 	imgPath     string
 	fullImgPath string
 	inputFile   string
@@ -48,7 +48,7 @@ type inferTask struct {
 // localInferResult 与 image.py 输出字段对齐
 type localInferResult struct {
 	ID          interface{}     `json:"id"`
-	Messages    string          `json:"messages"`
+	Messages    interface{}     `json:"messages,omitempty"`
 	ImgPath     string          `json:"img_path,omitempty"`
 	ImagePath   string          `json:"image_path,omitempty"`
 	StartTime   string          `json:"start_time,omitempty"`
@@ -213,7 +213,21 @@ func parseInferLine(line []byte, inputFile string, lineNum int) (*inferTask, str
 	if messageKey == "" {
 		messageKey = "messages"
 	}
-	messages, _ := row[messageKey].(string)
+	var messagesRaw []map[string]interface{}
+	if raw, exists := row[messageKey]; exists && raw != nil {
+		switch v := raw.(type) {
+		case []interface{}:
+			for _, item := range v {
+				if msg, ok := item.(map[string]interface{}); ok {
+					messagesRaw = append(messagesRaw, msg)
+				}
+			}
+		}
+	}
+	if len(messagesRaw) == 0 {
+		logInfo("警告: %s 第 %d 行缺少有效的 %s 数组，跳过", inputFile, lineNum, messageKey)
+		return nil, idStr
+	}
 	imgPath, _ := row["img_path"].(string)
 	imgPath = strings.TrimSpace(imgPath)
 
@@ -233,7 +247,7 @@ func parseInferLine(line []byte, inputFile string, lineNum int) (*inferTask, str
 
 	return &inferTask{
 		idValue:     idVal,
-		messages:    messages,
+		messagesRaw: messagesRaw,
 		imgPath:     imgPath,
 		fullImgPath: fullImg,
 		inputFile:   inputFile,
@@ -243,13 +257,9 @@ func parseInferLine(line []byte, inputFile string, lineNum int) (*inferTask, str
 
 func buildMessages(mc ModelConfig, task *inferTask) ([]map[string]interface{}, error) {
 	if strings.TrimSpace(task.imgPath) == "" {
-		return []map[string]interface{}{
-			{
-				"role":    "user",
-				"content": task.messages,
-			},
-		}, nil
+		return task.messagesRaw, nil
 	}
+
 	b, err := os.ReadFile(task.fullImgPath)
 	if err != nil {
 		return nil, err
@@ -257,20 +267,28 @@ func buildMessages(mc ModelConfig, task *inferTask) ([]map[string]interface{}, e
 	b64 := base64.StdEncoding.EncodeToString(b)
 	mime := imageMimeType(task.fullImgPath)
 	dataURL := fmt.Sprintf("data:%s;base64,%s", mime, b64)
-	return []map[string]interface{}{
-		{
-			"role": "user",
-			"content": []interface{}{
-				map[string]interface{}{"type": "text", "text": task.messages},
-				map[string]interface{}{
-					"type": "image_url",
-					"image_url": map[string]interface{}{
-						"url": dataURL,
-					},
-				},
-			},
+
+	messages := make([]map[string]interface{}, len(task.messagesRaw))
+	for i, msg := range task.messagesRaw {
+		clone := make(map[string]interface{}, len(msg))
+		for k, v := range msg {
+			clone[k] = v
+		}
+		messages[i] = clone
+	}
+	imagePart := map[string]interface{}{
+		"type": "image_url",
+		"image_url": map[string]interface{}{
+			"url": dataURL,
 		},
-	}, nil
+	}
+	messages = append(messages, map[string]interface{}{
+		"role": "user",
+		"content": []interface{}{
+			imagePart,
+		},
+	})
+	return messages, nil
 }
 
 func mergeChatRequestBody(body map[string]interface{}, mc ModelConfig) {
@@ -366,7 +384,7 @@ func runOneInferTask(ctx context.Context, client *http.Client, mc ModelConfig, t
 	nowStr := func() string { return time.Now().Format("2006-01-02 15:04:05") }
 	res := localInferResult{
 		ID:        task.idValue,
-		Messages:  task.messages,
+		Messages:  task.messagesRaw,
 		ImgPath:   task.imgPath,
 		ImagePath: task.fullImgPath,
 		Success:   false,
