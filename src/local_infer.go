@@ -428,24 +428,56 @@ func workerLimit(cfg LocalInferConfig, maxWorkers *int32) int32 {
 	return l
 }
 
+type passStats struct {
+	attempted int64
+	succeeded int64
+	failed    int64
+}
+
 func processOneJSONLFile(inputPath, outputPath string, mc ModelConfig, cfg LocalInferConfig, client *http.Client, maxWorkers *int32) error {
+	maxRetry := MAX_RETRY_COUNT
+	if maxRetry < 0 {
+		maxRetry = 0
+	}
+	logInfo("文件重试策略: input=%s max_retry_count=%d（整文件轮次重试）", inputPath, maxRetry)
+
+	for round := 0; round <= maxRetry; round++ {
+		stats, err := runOneJSONLPass(inputPath, outputPath, mc, cfg, client, maxWorkers, round)
+		if err != nil {
+			return err
+		}
+		logInfo("文件轮次完成: input=%s round=%d attempted=%d success=%d failed=%d", inputPath, round, stats.attempted, stats.succeeded, stats.failed)
+		if stats.failed == 0 {
+			logInfo("文件处理结束: %s 无需继续重试", inputPath)
+			return nil
+		}
+		if round == maxRetry {
+			logInfo("文件处理结束: %s 已达到最大轮次，仍有失败=%d", inputPath, stats.failed)
+			return nil
+		}
+	}
+	return nil
+}
+
+func runOneJSONLPass(inputPath, outputPath string, mc ModelConfig, cfg LocalInferConfig, client *http.Client, maxWorkers *int32, round int) (passStats, error) {
+	var stats passStats
 	processed, err := loadProcessedIDsFromJSONL(outputPath)
 	if err != nil {
-		return err
+		return stats, err
 	}
 	if len(processed) > 0 {
-		logInfo("断点续传: %s 已跳过 %d 条成功记录", outputPath, len(processed))
+		logInfo("轮次%d: %s 已有成功记录 %d 条（本轮跳过）", round, outputPath, len(processed))
 	}
 
 	inFile, err := os.Open(inputPath)
 	if err != nil {
-		return err
+		return stats, err
 	}
 	defer inFile.Close()
 
 	outFile, err := os.OpenFile(outputPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
 	if err != nil {
-		return err
+		return stats, err
 	}
 	defer outFile.Close()
 
@@ -473,7 +505,6 @@ func processOneJSONLFile(inputPath, outputPath string, mc ModelConfig, cfg Local
 	}
 
 	var inFlight int32
-	var completed int64
 
 	workerLoop := func() {
 		defer wg.Done()
@@ -485,6 +516,13 @@ func processOneJSONLFile(inputPath, outputPath string, mc ModelConfig, cfg Local
 			res := runOneInferTask(context.Background(), client, mc, task)
 			atomic.AddInt32(&inFlight, -1)
 
+			atomic.AddInt64(&stats.attempted, 1)
+			if res.Success {
+				atomic.AddInt64(&stats.succeeded, 1)
+			} else {
+				atomic.AddInt64(&stats.failed, 1)
+			}
+
 			writeMu.Lock()
 			buf = append(buf, res)
 			shouldFlush := len(buf) >= cfg.FlushEvery
@@ -494,7 +532,7 @@ func processOneJSONLFile(inputPath, outputPath string, mc ModelConfig, cfg Local
 					logError("写入结果失败: %v", err)
 				}
 			}
-			n := atomic.AddInt64(&completed, 1)
+			n := atomic.LoadInt64(&stats.attempted)
 			st := "✓"
 			if !res.Success {
 				st = "✗"
@@ -551,9 +589,9 @@ func processOneJSONLFile(inputPath, outputPath string, mc ModelConfig, cfg Local
 	if err := scanner.Err(); err != nil {
 		close(taskCh)
 		wg.Wait()
-		return err
+		return stats, err
 	}
 	close(taskCh)
 	wg.Wait()
-	return flush()
+	return stats, flush()
 }
