@@ -7,12 +7,25 @@ model:
   max_tokens: 16384
   messages_key: "messages"
   password: ""
+  # 可选：本地并发推理（-local-infer）使用的 Chat Completions 根路径，默认 https://maas-api.cn-huabei-1.xf-yun.com/v2
+  # api_base_url: "https://maas-api.cn-huabei-1.xf-yun.com/v2"
   temperature: 0.6
   extra_body: {
     "stop": ["a", "b"],
     "continue_final_message": true
   }
   enable_thinking: false
+
+# 可选：-local-infer 模式（JSONL 直连接口、图片/文本）调参，不配则使用内置默认
+# local_infer:
+#   batch_load_size: 1000
+#   initial_workers: 60
+#   concurrency_ratio: 0.7
+#   prometheus_interval_sec: 5
+#   http_timeout_sec: 7200
+#   submit_interval_ms: 100
+#   max_pool_cap: 2000
+#   flush_every: 10
 
 # 处理配置
 test_lines: -1        # -1 不进行测试，其他数字为测试行数

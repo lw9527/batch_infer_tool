@@ -1099,6 +1099,7 @@ func main() {
 	var monitorProvided bool // 标记是否提供了 -monitor 参数
 	var daemonInternal bool
 	var mergeOutput string
+	var localInferFiles string
 
 	flag.StringVar(&configPath, "config", "", "模型配置文件路径（YAML格式），如果不指定则使用默认配置./config.yaml")
 	flag.StringVar(&pipeline, "pipeline", "", "数据文件路径,运行完整流程（分割->上传->处理->合并->重试->结束）")
@@ -1106,6 +1107,7 @@ func main() {
 	flag.StringVar(&cancel, "cancel", "", "具体task_id取消调度")
 	flag.StringVar(&monitor, "monitor", "", "监控文件状态，不传task_id则显示所有进行中的文件")
 	flag.StringVar(&mergeOutput, "merge-output", "", "仅执行合并输出步骤，值为 task_id")
+	flag.StringVar(&localInferFiles, "local-infer", "", "本地 JSONL 并发推理：逗号分隔的输入文件路径（每行 JSON：id/query/img_path），输出为同目录 *_result.jsonl")
 
 	flag.BoolVar(&daemonInternal, "daemon-internal", false, "内部标志：守护进程内部运行（不要手动使用）")
 
@@ -1158,8 +1160,20 @@ func main() {
 		service.RunDaemonInternal()
 		return
 	}
-	go service.RunDaemon()
+	if localInferFiles == "" {
+		go service.RunDaemon()
+	}
 	switch {
+	case localInferFiles != "":
+		paths := parseCommaPaths(localInferFiles)
+		if len(paths) == 0 {
+			logError("local-infer 未提供有效文件路径")
+			os.Exit(1)
+		}
+		if err := RunLocalInfer(paths); err != nil {
+			logError("local-infer 失败: %v", err)
+			os.Exit(1)
+		}
 	case pipeline != "":
 		if taskId == "" {
 			logError("task-id 参数不能为空")

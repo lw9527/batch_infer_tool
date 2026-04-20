@@ -6,18 +6,52 @@ model:
   domain: "xwenlitest2"
   max_tokens: 16384
   messages_key: "messages"
-  password: ""
+  password: "bf90d19d203b86f9eedec88bb2b490bf:ZmZiMjg2MTA2N2U3YjE5Mjk4Zjg5Yzc1"
   temperature: 0.6
   extra_body: {
     "stop": ["a", "b"],
-    "continue_final_message": true
+    "continue_final_message": "true"
   }
-  enable_thinking: false
+  enable_thinking: true
+#   tool_choice: "required"
+#   tools: [
+#     {
+#         "type": "function",
+#         "function": {
+#             "name": "get_current_time",
+#             "description": "当你想知道现在的时间时非常有用。",
+#             "parameters": {}  # 因为获取当前时间无需输入参数，因此parameters为空字典
+#         }
+#     },  
+#     # 工具2 获取指定城市的天气
+#     {
+#         "type": "function",
+#         "function": {
+#             "name": "get_current_weather",
+#             "description": "当你想查询指定城市的天气时非常有用。",
+#             "parameters": {  
+#                 "type": "object",
+#                 "properties": {
+#                     # 查询天气时需要提供位置，因此参数设置为location
+#                     "location": {
+#                         "type": "string",
+#                         "description": "城市或县区，比如北京市、杭州市、余杭区等。"
+#                     }
+#                 },
+#                 "required": [""]
+#             }
+#         }
+#     }
+# ]
   # stop: ["a", "b"]
   # continue_final_message: true
 
 # 处理配置
 test_lines: 300        # 测试行数
 max_retry_count: 0    # 最大重试次数
-lines_per_chunk: 200 # 默认每个分块50000行，不能超过这个值
+lines_per_chunk: 1 # 默认每个分块50000行，不能超过这个值
 
+
+# batch_size: 池子大小限制，最大任务排队数量
+# readMe
+# 单个api并发限制

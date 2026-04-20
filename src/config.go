@@ -30,6 +30,7 @@ type ModelConfig struct {
 	MaxTokens      int                    `yaml:"max_tokens"`
 	MessagesKey    string                 `yaml:"messages_key"`
 	Password       string                 `yaml:"password"`
+	APIBaseURL     string                 `yaml:"api_base_url"` // 本地并发推理用 Chat Completions 根 URL，空则使用默认 MaaS v2 地址
 	Temperature    *float64               `yaml:"temperature"`
 	TopP           *float64               `yaml:"top_p"`
 	EnableThinking *bool                  `yaml:"enable_thinking"`
@@ -38,18 +39,32 @@ type ModelConfig struct {
 	ToolChoice     any                    `yaml:"tool_choice"`
 }
 
+// LocalInferConfig 本地 JSONL 并发推理（与 image.py 行为对齐）的可选调参
+type LocalInferConfig struct {
+	BatchLoadSize         int     `yaml:"batch_load_size"`         // 每批读入队列的任务数，默认 1000
+	InitialWorkers        int     `yaml:"initial_workers"`         // Prometheus 返回 0 时的初始并发，默认 60
+	ConcurrencyRatio      float64 `yaml:"concurrency_ratio"`       // 动态并发 = floor(部署路数 * ratio)，默认 0.7
+	PrometheusIntervalSec int     `yaml:"prometheus_interval_sec"` // 刷新路数间隔秒，默认 5
+	HTTPTimeoutSec        int     `yaml:"http_timeout_sec"`        // 单次请求超时秒，默认 7200
+	SubmitIntervalMs      int     `yaml:"submit_interval_ms"`      // 提交间隔毫秒，默认 100
+	MaxPoolCap            int     `yaml:"max_pool_cap"`            // 内部池上限，默认 2000
+	FlushEvery            int     `yaml:"flush_every"`             // 累计多少条刷盘，默认 10
+}
+
 // Config 配置结构
 type Config struct {
-	Model            ModelConfig `yaml:"model"`
-	TestLines        *int        `yaml:"test_lines"`           // -1 不进行测试，其他数字为测试行数
-	MaxRetryCount    *int        `yaml:"max_retry_count"`      // 最大重试次数（默认0，实际值从文件表的max_retry字段读取）
-	LinesPerChunk    *int        `yaml:"lines_per_chunk"`      // 默认每个分块50000行，不能超过这个值
-	MaxLogFileSizeMB *int        `yaml:"max_log_file_size_mb"` // 单个日志文件最大大小（单位MB），默认100MB
+	Model            ModelConfig       `yaml:"model"`
+	LocalInfer       *LocalInferConfig `yaml:"local_infer"`
+	TestLines        *int              `yaml:"test_lines"`           // -1 不进行测试，其他数字为测试行数
+	MaxRetryCount    *int              `yaml:"max_retry_count"`      // 最大重试次数（默认0，实际值从文件表的max_retry字段读取）
+	LinesPerChunk    *int              `yaml:"lines_per_chunk"`      // 默认每个分块50000行，不能超过这个值
+	MaxLogFileSizeMB *int              `yaml:"max_log_file_size_mb"` // 单个日志文件最大大小（单位MB），默认100MB
 }
 
 // model 配置变量（从 YAML 文件加载）
 var (
-	ModelConf ModelConfig
+	ModelConf      ModelConfig
+	LocalInferConf LocalInferConfig
 )
 
 // LoadConfig 从 YAML 文件加载配置
@@ -71,6 +86,10 @@ func LoadConfig(configPath string) error {
 
 	// 设置配置值
 	ModelConf = config.Model
+	if config.LocalInfer != nil {
+		LocalInferConf = *config.LocalInfer
+	}
+	applyLocalInferDefaults(&LocalInferConf)
 
 	// 验证配置
 	if ModelConf.Domain == "" {
@@ -109,6 +128,33 @@ func LoadConfig(configPath string) error {
 
 	logInfo("配置文件加载成功: %s", configPath)
 	return nil
+}
+
+func applyLocalInferDefaults(c *LocalInferConfig) {
+	if c.BatchLoadSize <= 0 {
+		c.BatchLoadSize = 1000
+	}
+	if c.InitialWorkers <= 0 {
+		c.InitialWorkers = 60
+	}
+	if c.ConcurrencyRatio <= 0 {
+		c.ConcurrencyRatio = 0.7
+	}
+	if c.PrometheusIntervalSec <= 0 {
+		c.PrometheusIntervalSec = 5
+	}
+	if c.HTTPTimeoutSec <= 0 {
+		c.HTTPTimeoutSec = 7200
+	}
+	if c.SubmitIntervalMs < 0 {
+		c.SubmitIntervalMs = 100
+	}
+	if c.MaxPoolCap <= 0 {
+		c.MaxPoolCap = 2000
+	}
+	if c.FlushEvery <= 0 {
+		c.FlushEvery = 10
+	}
 }
 
 func init() {
