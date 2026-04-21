@@ -1090,8 +1090,7 @@ func (bis *BatchInferService) DeleteFile(taskID string) {
 }
 
 func main() {
-	initLogger()
-	logInfo("========== 程序启动 ==========")
+	var showVersion bool
 
 	// var pipeline, split, upload, process, merge, taskId, cancel, monitor, deleteFile string
 	var pipeline, taskId, cancel, monitor string
@@ -1101,6 +1100,7 @@ func main() {
 	var mergeOutput string
 	var localInferFiles string
 
+	flag.BoolVar(&showVersion, "v", false, "显示版本信息后退出")
 	flag.StringVar(&configPath, "config", "", "模型配置文件路径（YAML格式），如果不指定则使用默认配置./config.yaml")
 	flag.StringVar(&pipeline, "pipeline", "", "数据文件路径,运行完整流程（分割->上传->处理->合并->重试->结束）")
 	flag.StringVar(&taskId, "task-id", "", "pipeline 传参，task_id不能为空")
@@ -1134,6 +1134,14 @@ func main() {
 
 	// 先解析一次以获取 configPath（如果提供了）
 	flag.Parse()
+
+	if showVersion {
+		fmt.Println(formatVersion())
+		os.Exit(0)
+	}
+
+	initLogger()
+	logInfo("========== 程序启动 ==========")
 
 	// 加载配置文件
 	if configPath == "" {
