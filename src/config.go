@@ -45,6 +45,8 @@ type LocalInferConfig struct {
 	InitialWorkers        int     `yaml:"initial_workers"`         // Prometheus 返回 0 时的初始并发，默认 60
 	ConcurrencyRatio      float64 `yaml:"concurrency_ratio"`       // 动态并发 = floor(部署路数 * ratio)，默认 0.7
 	PrometheusIntervalSec int     `yaml:"prometheus_interval_sec"` // 刷新路数间隔秒，默认 5
+	BandwidthMonitor      *bool   `yaml:"bandwidth_monitor"`       // 是否监控本地上/下行带宽，默认 true
+	BandwidthIntervalSec  int     `yaml:"bandwidth_interval_sec"`  // 带宽采样间隔秒，默认 10
 	HTTPTimeoutSec        int     `yaml:"http_timeout_sec"`        // 单次请求超时秒，默认 7200
 	SubmitIntervalMs      int     `yaml:"submit_interval_ms"`      // 提交间隔毫秒，默认 100
 	MaxPoolCap            int     `yaml:"max_pool_cap"`            // 内部池上限，默认 2000
@@ -142,6 +144,13 @@ func applyLocalInferDefaults(c *LocalInferConfig) {
 	}
 	if c.PrometheusIntervalSec <= 0 {
 		c.PrometheusIntervalSec = 5
+	}
+	if c.BandwidthIntervalSec <= 0 {
+		c.BandwidthIntervalSec = 10
+	}
+	if c.BandwidthMonitor == nil {
+		v := true
+		c.BandwidthMonitor = &v
 	}
 	if c.HTTPTimeoutSec <= 0 {
 		c.HTTPTimeoutSec = 7200

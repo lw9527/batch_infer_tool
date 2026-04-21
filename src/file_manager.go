@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"crypto/md5"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -44,6 +45,67 @@ type chunkMergeResult struct {
 	logEachMissing bool
 	completedCount int
 	totalCount     int
+}
+
+var batchImageMimeByExt = map[string]string{
+	".jpg":  "image/jpeg",
+	".jpeg": "image/jpeg",
+	".png":  "image/png",
+	".gif":  "image/gif",
+	".bmp":  "image/bmp",
+	".webp": "image/webp",
+	".tiff": "image/tiff",
+	".tif":  "image/tiff",
+}
+
+func batchImageMimeType(path string) string {
+	ext := strings.ToLower(filepath.Ext(path))
+	if m, ok := batchImageMimeByExt[ext]; ok {
+		return m
+	}
+	return "image/jpeg"
+}
+
+func appendImageToMessagesIfNeeded(originJSON map[string]interface{}, messages []interface{}, inputFilePath string) ([]interface{}, error) {
+	rawPath, ok := originJSON["img_path"]
+	if !ok || rawPath == nil {
+		return messages, nil
+	}
+	imgPath, ok := rawPath.(string)
+	if !ok {
+		return messages, nil
+	}
+	imgPath = strings.TrimSpace(imgPath)
+	if imgPath == "" {
+		return messages, nil
+	}
+
+	fullPath := imgPath
+	if !filepath.IsAbs(fullPath) {
+		fullPath = filepath.Join(filepath.Dir(inputFilePath), filepath.Clean(imgPath))
+	}
+
+	imageBytes, err := os.ReadFile(fullPath)
+	if err != nil {
+		return nil, fmt.Errorf("读取图片失败(%s): %w", fullPath, err)
+	}
+	base64Data := base64.StdEncoding.EncodeToString(imageBytes)
+	dataURL := fmt.Sprintf("data:%s;base64,%s", batchImageMimeType(fullPath), base64Data)
+
+	// 与 local_infer 一致：在原始 messages 末尾追加一条仅图片的 user 消息
+	out := append([]interface{}(nil), messages...)
+	out = append(out, map[string]interface{}{
+		"role": "user",
+		"content": []interface{}{
+			map[string]interface{}{
+				"type": "image_url",
+				"image_url": map[string]interface{}{
+					"url": dataURL,
+				},
+			},
+		},
+	})
+	return out, nil
 }
 
 func parseCustomID(line []byte) (string, error) {
@@ -469,6 +531,11 @@ func (fm *FileManager) SplitFile(filePath string, originalFilename string, taskI
 			// 构建新行
 			messages, ok := originJSON[mc.MessagesKey].([]interface{})
 			if !ok {
+				continue
+			}
+			messages, err = appendImageToMessagesIfNeeded(originJSON, messages, filePath)
+			if err != nil {
+				logError("line %d 处理图片失败: %v", lineCount, err)
 				continue
 			}
 			body := map[string]interface{}{

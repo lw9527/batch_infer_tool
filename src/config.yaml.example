@@ -22,6 +22,8 @@ model:
 #   initial_workers: 60
 #   concurrency_ratio: 0.7
 #   prometheus_interval_sec: 5
+#   bandwidth_monitor: true
+#   bandwidth_interval_sec: 10
 #   http_timeout_sec: 7200
 #   submit_interval_ms: 100
 #   max_pool_cap: 2000

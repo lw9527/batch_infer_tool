@@ -15,6 +15,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	gnet "github.com/shirou/gopsutil/v3/net"
 )
 
 const defaultLocalChatAPIBase = "https://maas-api.cn-huabei-1.xf-yun.com/v2"
@@ -99,6 +101,9 @@ func RunLocalInfer(inputFiles []string) error {
 	defer cancel()
 
 	go monitorPrometheusForLocalInfer(ctx, mc.Domain, &maxWorkers, cfg)
+	if cfg.BandwidthMonitor != nil && *cfg.BandwidthMonitor {
+		go monitorLocalBandwidth(ctx, cfg)
+	}
 
 	for _, inputPath := range inputFiles {
 		outPath := defaultResultPath(inputPath)
@@ -108,6 +113,63 @@ func RunLocalInfer(inputFiles []string) error {
 		}
 	}
 	return nil
+}
+
+func monitorLocalBandwidth(ctx context.Context, cfg LocalInferConfig) {
+	interval := time.Duration(cfg.BandwidthIntervalSec) * time.Second
+	if interval <= 0 {
+		interval = 10 * time.Second
+	}
+
+	prevSent, prevRecv, err := readTotalIOCounters()
+	if err != nil {
+		logInfo("带宽监控初始化失败: %v", err)
+		return
+	}
+	prevTime := time.Now()
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case now := <-ticker.C:
+			sent, recv, err := readTotalIOCounters()
+			if err != nil {
+				logInfo("带宽监控采样失败: %v", err)
+				continue
+			}
+			elapsed := now.Sub(prevTime).Seconds()
+			if elapsed <= 0 {
+				continue
+			}
+			upMbps := float64(sent-prevSent) * 8 / 1024 / 1024 / elapsed
+			downMbps := float64(recv-prevRecv) * 8 / 1024 / 1024 / elapsed
+			logInfo("带宽监控: 上行=%.2f Mbps 下行=%.2f Mbps", upMbps, downMbps)
+
+			prevSent, prevRecv = sent, recv
+			prevTime = now
+		}
+	}
+}
+
+func readTotalIOCounters() (uint64, uint64, error) {
+	counters, err := gnet.IOCounters(true)
+	if err != nil {
+		return 0, 0, err
+	}
+	var totalSent, totalRecv uint64
+	for _, c := range counters {
+		// 排除回环与虚拟隧道，避免噪声；其余网卡累加统计
+		name := strings.ToLower(c.Name)
+		if strings.Contains(name, "loopback") || strings.HasPrefix(name, "lo") || strings.Contains(name, "isatap") || strings.Contains(name, "teredo") {
+			continue
+		}
+		totalSent += c.BytesSent
+		totalRecv += c.BytesRecv
+	}
+	return totalSent, totalRecv, nil
 }
 
 func calcWorkersFromTotal(total int, cfg LocalInferConfig) int {
